@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-tui-stats",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "OpenCode 1 TUI plugin that shows live TPS, average TPS, and average time to first token in the session prompt.",
   "type": "module",
   "exports": {
