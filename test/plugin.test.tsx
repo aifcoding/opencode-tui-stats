@@ -3,7 +3,7 @@ import { RGBA } from "@opentui/core"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import { render, type JSX } from "@opentui/solid"
 import type { TuiPluginApi, TuiPluginMeta, TuiRouteCurrent } from "@opencode-ai/plugin/tui"
-import type { Message, Part, SessionStatus, ToolPart } from "@opencode-ai/sdk/v2"
+import type { Message, Part, Session, SessionStatus, ToolPart } from "@opencode-ai/sdk/v2"
 import { batch, createSignal, Show } from "solid-js"
 import type { TrackerInternals } from "../tracker"
 
@@ -29,6 +29,7 @@ type Listener = (event: unknown) => void
 type Harness = {
   emit(type: string, properties: Record<string, unknown>): void
   setStatus(sessionID: string, status: SessionStatus | undefined): void
+  setSession(sessionID: string, parentID?: string): void
   setParts(messageID: string, value: Part[]): void
   switchSession(sessionID: string): void
   setRoute(route: TuiRouteCurrent): void
@@ -36,6 +37,7 @@ type Harness = {
   frame(): string
   subscriptionCount(): number
   partLookups(): number
+  sessionLookups(): number
   renderRequests(): number
   controller(): ReturnType<typeof controller>
   dispose(): Promise<void>
@@ -102,17 +104,32 @@ function assistantMessage(input: {
   }
 }
 
+function sessionInfo(id: string, parentID?: string): Session {
+  return {
+    id,
+    slug: id,
+    projectID: "project",
+    directory: "/",
+    title: id,
+    version: "1.0.0",
+    parentID,
+    time: { created: 1, updated: 1 },
+  }
+}
+
 async function createHarness(): Promise<Harness> {
   const screen: TestRendererSetup = await createTestRenderer({ width: 120, height: 24 })
   const listeners = new Map<string, Set<Listener>>()
   const subscriptions = new Set<() => void>()
   const statuses = new Map<string, SessionStatus>()
+  const sessions = new Map<string, Session>()
   const parts = new Map<string, Part[]>()
   const disposeHandlers: Array<() => void | Promise<void>> = []
   const [routeState, setRouteState] = createSignal<TuiRouteCurrent>({ name: "session", params: { sessionID: "one" } })
   let sidebarRender: SidebarRender | undefined
   let disposed = false
   let partLookups = 0
+  let sessionLookups = 0
   let renderRequests = 0
 
   const api = {
@@ -131,7 +148,13 @@ async function createHarness(): Promise<Harness> {
       },
     },
     state: {
-      session: { status: (sessionID: string) => statuses.get(sessionID) },
+      session: {
+        status: (sessionID: string) => statuses.get(sessionID),
+        get: (sessionID: string) => {
+          sessionLookups += 1
+          return sessions.get(sessionID)
+        },
+      },
       part: (messageID: string) => {
         partLookups += 1
         return parts.get(messageID) ?? []
@@ -147,7 +170,7 @@ async function createHarness(): Promise<Harness> {
     slots: {
       register(registered: { slots?: Record<string, unknown> }) {
         const slots = registered.slots ?? {}
-        if (typeof slots.sidebar_content === "function") sidebarRender = slots.sidebar_content as SidebarRender
+        if (typeof slots.sidebar_footer === "function") sidebarRender = slots.sidebar_footer as SidebarRender
         return "opencode-tui-stats"
       },
     },
@@ -200,6 +223,9 @@ async function createHarness(): Promise<Harness> {
       if (status === undefined) statuses.delete(sessionID)
       else statuses.set(sessionID, status)
     },
+    setSession(sessionID, parentID) {
+      sessions.set(sessionID, sessionInfo(sessionID, parentID))
+    },
     setParts(messageID, value) {
       parts.set(messageID, value)
     },
@@ -221,6 +247,9 @@ async function createHarness(): Promise<Harness> {
     partLookups() {
       return partLookups
     },
+    sessionLookups() {
+      return sessionLookups
+    },
     renderRequests() {
       return renderRequests
     },
@@ -235,14 +264,37 @@ async function createHarness(): Promise<Harness> {
   }
 }
 
-function completeStep(harness: Harness, sessionID: string, base: number, output: number) {
-  const messageID = `${sessionID}-message`
-  const partID = `${sessionID}-part`
+function completeMessage(
+  harness: Harness,
+  sessionID: string,
+  base: number,
+  options: {
+    id?: string
+    output?: number
+    input?: number
+    cacheRead?: number
+    cacheWrite?: number
+    cost?: number
+    providerID?: string
+    modelID?: string
+  } = {},
+) {
+  const messageID = options.id ?? `${sessionID}-message`
+  const partID = `${messageID}-part`
   harness.setStatus(sessionID, { type: "busy" })
   harness.setParts(messageID, [textPart(partID, messageID, sessionID)])
 
   setSystemTime(base)
-  harness.emit("message.updated", { sessionID, info: assistantMessage({ id: messageID, sessionID, created: base }) })
+  harness.emit("message.updated", {
+    sessionID,
+    info: assistantMessage({
+      id: messageID,
+      sessionID,
+      created: base,
+      providerID: options.providerID,
+      modelID: options.modelID,
+    }),
+  })
 
   setSystemTime(base + 500)
   harness.emit("message.part.delta", {
@@ -256,8 +308,26 @@ function completeStep(harness: Harness, sessionID: string, base: number, output:
   setSystemTime(base + 2_500)
   harness.emit("message.updated", {
     sessionID,
-    info: assistantMessage({ id: messageID, sessionID, created: base, completed: base + 2_500, output, reasoning: 0, finish: "stop" }),
+    info: assistantMessage({
+      id: messageID,
+      sessionID,
+      created: base,
+      completed: base + 2_500,
+      output: options.output ?? 0,
+      reasoning: 0,
+      input: options.input,
+      cacheRead: options.cacheRead,
+      cacheWrite: options.cacheWrite,
+      cost: options.cost,
+      finish: "stop",
+      providerID: options.providerID,
+      modelID: options.modelID,
+    }),
   })
+}
+
+function completeStep(harness: Harness, sessionID: string, base: number, output: number) {
+  completeMessage(harness, sessionID, base, { output })
 }
 
 test("empty session renders the placeholder row", async () => {
@@ -327,6 +397,7 @@ test("streaming deltas produce a live TPS reading", async () => {
   }
 
   await harness.renderOnce()
+  expect(harness.frame()).toContain("AVG — · TPS 10.0t/s")
   expect(harness.frame()).toContain("TPS 10.0")
 })
 
@@ -378,9 +449,69 @@ test("cache hit rate and cost accumulate from a completed step", async () => {
 
   await harness.renderOnce()
   const frame = harness.frame()
-  expect(frame).toContain("CACHE 31%")
+  expect(frame).toContain("CACHE  31%")
   expect(frame).toContain("$0.0073")
   expect(frame).not.toContain("retries")
+
+  // Both detail lines are indented under the model row and carry explicit units.
+  const avgLine = frame.split("\n").find((line) => line.includes("AVG "))!
+  const ttftLine = frame.split("\n").find((line) => line.includes("TTFT "))!
+  expect(avgLine.startsWith("   AVG ")).toBe(true)
+  expect(ttftLine.startsWith("   TTFT ")).toBe(true)
+  expect(avgLine).toContain("t/s")
+  expect(ttftLine).toContain("CACHE  ")
+})
+
+test("expanded rows align metric columns and omit idle TPS", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  // The first model repeats its provider name, so the muted prefix is dropped.
+  completeMessage(harness, "one", base, {
+    providerID: "deepseek",
+    modelID: "deepseek-flash",
+    input: 1_000,
+    cacheRead: 0,
+    cost: 0.007337112,
+    output: 20,
+  })
+  completeMessage(harness, "one", base + 100_000, {
+    id: "one-message-2",
+    providerID: "deepseek",
+    modelID: "other",
+    input: 0,
+    cacheRead: 1_000,
+    cost: 0.65,
+    output: 20,
+  })
+
+  // The active row ("other") starts expanded; open the older row as well.
+  harness.controller().toggle("deepseek/deepseek-flash")
+  await harness.renderOnce()
+  const frame = harness.frame()
+
+  expect(frame).toContain("▼ deepseek-flash")
+  expect(frame).not.toContain("deepseek/deepseek-flash")
+  expect(frame).toContain("deepseek/other")
+  // Idle rows never render an empty TPS field.
+  expect(frame).not.toContain("TPS")
+
+  const avgLines = frame.split("\n").filter((line) => line.includes("AVG "))
+  const detailLines = frame.split("\n").filter((line) => line.includes("TTFT "))
+  expect(avgLines).toHaveLength(2)
+  expect(detailLines).toHaveLength(2)
+  for (const line of avgLines) expect(line.startsWith("   AVG ")).toBe(true)
+  for (const line of detailLines) expect(line.startsWith("   TTFT ")).toBe(true)
+
+  // The same field starts on the same column even when the percentage width changes.
+  expect(new Set(avgLines.map((line) => line.indexOf("AVG "))).size).toBe(1)
+  expect(new Set(detailLines.map((line) => line.indexOf("CACHE "))).size).toBe(1)
+  expect(new Set(detailLines.map((line) => line.indexOf("$"))).size).toBe(1)
+  expect(detailLines.some((line) => line.includes("CACHE   0%"))).toBe(true)
+  expect(detailLines.some((line) => line.includes("CACHE 100%"))).toBe(true)
+  expect(detailLines.some((line) => line.includes("$0.0073"))).toBe(true)
+  expect(detailLines.some((line) => line.includes("$0.6500"))).toBe(true)
 })
 
 test("retry count follows the reported attempt number", async () => {
@@ -471,7 +602,7 @@ test("re-emitting a completed message does not accumulate twice", async () => {
 
   await harness.renderOnce()
   const frame = harness.frame()
-  expect(frame).toContain("CACHE 31%")
+  expect(frame).toContain("CACHE  31%")
   expect(frame).toContain("$0.0073")
 })
 
@@ -650,7 +781,7 @@ test("tool-only turn still accumulates AVG and TTFT", async () => {
   expect(frame).toContain("TTFT 0.5s")
 })
 
-test("model panel lists the active model first with an active marker", async () => {
+test("model panel lists the active model first", async () => {
   const harness = await createHarness()
   activeHarness = harness
 
@@ -666,7 +797,8 @@ test("model panel lists the active model first with an active marker", async () 
   await harness.renderOnce()
   const frame = harness.frame()
   expect(internals().activeModel("one")).toBe("provider/b")
-  expect(frame).toContain("provider/b   active")
+  expect(frame).toContain("▼ provider/b")
+  expect(frame).not.toContain("active")
   expect(frame.indexOf("provider/b")).toBeLessThan(frame.indexOf("provider/a"))
 })
 
@@ -683,7 +815,7 @@ test("model panel caps at four models and reports the overflow", async () => {
 
   await harness.renderOnce()
   const frame = harness.frame()
-  expect(frame).toContain("provider/f   active")
+  expect(frame).toContain("▼ provider/f")
   expect(frame).toContain("+2 more models")
   expect(frame).not.toContain("provider/a")
   expect(frame).not.toContain("provider/b")
@@ -753,4 +885,104 @@ test("toggling an inactive row expands only that row", async () => {
   const frame = harness.frame()
   expect(frame).toContain("▼ provider/a")
   expect((frame.match(/TTFT /g) ?? []).length).toBe(2)
+})
+
+test("subagent models are merged into the parent session panel", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  harness.setSession("one")
+  harness.setSession("child", "one")
+  harness.emit("session.created", { sessionID: "one", info: sessionInfo("one") })
+  harness.emit("session.created", { sessionID: "child", info: sessionInfo("child", "one") })
+
+  completeMessage(harness, "one", base, { modelID: "a" })
+  completeMessage(harness, "child", base + 100_000, { modelID: "b" })
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(frame).toContain("provider/a")
+  expect(frame).toContain("↳ provider/b")
+  // The expanded (active) row is the current session's most recent model; the subagent row stays collapsed.
+  expect(frame).toContain("▼ provider/a")
+})
+
+test("parent and subagent sharing one model collapse into a single summed row", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  harness.setSession("child", "one")
+  harness.emit("session.created", { sessionID: "child", info: sessionInfo("child", "one") })
+
+  completeMessage(harness, "one", base, { output: 20 })
+  completeMessage(harness, "child", base + 100_000, { output: 30 })
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  // One row only: the model name appears once (detail lines never repeat it).
+  expect((frame.match(/provider\/model/g) ?? []).length).toBe(1)
+  expect(frame).toContain("↳ provider/model")
+  // steps=2, tokens=50 over 2 x 2000ms → 12.5 tok/s; TTFT stays 0.5s per step.
+  expect(frame).toContain("AVG 12.5")
+  expect(frame).toContain("TTFT 0.5s")
+})
+
+test("grandchild sessions are folded into the root panel", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  for (const [id, parentID] of [
+    ["one", undefined],
+    ["child", "one"],
+    ["grandchild", "child"],
+  ] as const) {
+    harness.setSession(id, parentID)
+    harness.emit("session.created", { sessionID: id, info: sessionInfo(id, parentID) })
+  }
+
+  completeMessage(harness, "one", base, { modelID: "a" })
+  completeMessage(harness, "grandchild", base + 100_000, { modelID: "c" })
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(frame).toContain("provider/a")
+  expect(frame).toContain("↳ provider/c")
+})
+
+test("session CACHE aggregates the whole subtree", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  harness.setSession("child", "one")
+  harness.emit("session.created", { sessionID: "child", info: sessionInfo("child", "one") })
+
+  // Parent: input 1000 + cacheRead 1000 → 2000 promptable, 1000 cached.
+  completeMessage(harness, "one", base, { input: 1_000, cacheRead: 1_000 })
+  // Child: input 0 + cacheRead 3000 → 3000 promptable, 3000 cached.
+  completeMessage(harness, "child", base + 100_000, { input: 0, cacheRead: 3_000 })
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(frame).toContain("CACHE 80%")
+  expect(frame).toContain("Session CACHE 80%")
+})
+
+test("a child session observed only through state is linked lazily", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  // No session.created/updated event: the relation only exists in `api.state.session.get`.
+  harness.setSession("child", "one")
+
+  completeMessage(harness, "child", base, { modelID: "b" })
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(frame).toContain("↳ provider/b")
+  expect(harness.sessionLookups()).toBeGreaterThan(0)
 })

@@ -41,6 +41,8 @@ export type ModelAggregate = {
   totalDurationMs: number
   totalTtftMs: number
   stepCount: number
+  /** Last time this model was observed in this session (merged with `max` across a subtree). */
+  lastAt: number
 }
 
 export type SessionModels = {
@@ -60,6 +62,8 @@ export type Tracker = {
   stats: Record<string, SessionStats>
   dedup: Record<string, Set<string>>
   models: Record<string, SessionModels>
+  /** `sessionID -> parentID`; a key that is present with an `undefined` value is a confirmed root. */
+  parentOf: Record<string, string | undefined>
 }
 
 const STREAM_WINDOW_MS = 5_000
@@ -72,6 +76,8 @@ const DEDUP_WINDOW_LIMIT = 64
 /** Cap on `messageID -> model` entries retained per session (FIFO). */
 const MESSAGE_MODEL_LIMIT = 256
 const SESSION_LIMIT = 64
+/** Maximum number of descendant sessions folded into one panel (cycle-safe traversal bound). */
+const SUBTREE_LIMIT = 64
 /** Maximum number of model rows rendered in the sidebar panel. */
 export const MODEL_ROW_LIMIT = 4
 
@@ -89,6 +95,7 @@ function emptyAggregate(): ModelAggregate {
     totalDurationMs: 0,
     totalTtftMs: 0,
     stepCount: 0,
+    lastAt: 0,
   }
 }
 
@@ -145,7 +152,8 @@ export function cacheText(stats: { cacheRead: number; cachePrompt: number } | un
 
 export function costText(stats: { cost: number; steps: number } | undefined) {
   if (!stats || stats.steps <= 0) return undefined
-  return `$${stats.cost >= 1 ? stats.cost.toFixed(2) : stats.cost.toFixed(4)}`
+  // Always four decimals so the cost column keeps a stable width as spend grows.
+  return `$${stats.cost.toFixed(4)}`
 }
 
 /** FIFO-bound a Set so it never grows past `limit`. */
@@ -172,6 +180,8 @@ export type ModelRow = {
   key: string
   label: string
   active: boolean
+  /** True when any descendant (subagent) session contributed data to this row. */
+  subagent?: boolean
   tps?: string
   avg?: string
   ttft?: string
@@ -221,7 +231,15 @@ export function getLastInternals(): TrackerInternals | undefined {
 }
 
 export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerHandle {
-  const tracker: Tracker = { samples: {}, timings: {}, averages: {}, stats: {}, dedup: {}, models: {} }
+  const tracker: Tracker = {
+    samples: {},
+    timings: {},
+    averages: {},
+    stats: {},
+    dedup: {},
+    models: {},
+    parentOf: {},
+  }
   const partDecisions = new Map<string, boolean>()
   const mounted = new Set<string>()
   const order: string[] = []
@@ -251,6 +269,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     delete tracker.samples[sessionID]
     delete tracker.dedup[sessionID]
     delete tracker.models[sessionID]
+    delete tracker.parentOf[sessionID]
     clearTimings(sessionID)
   }
 
@@ -305,7 +324,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
   }
 
   /** Live rate restricted to samples attributed to `key` via the `messageID -> model` mapping. */
-  const liveRateFor = (sessionID: string, key: string) => {
+  const sessionLiveRate = (sessionID: string, key: string) => {
     const status = api.state.session.status(sessionID)
     if (!status || status.type === "idle") return undefined
 
@@ -321,34 +340,158 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     return formatRate(tokens / (activeDuration(samples, now) / 1_000))
   }
 
-  const modelRows = (sessionID: string): ModelPanel => {
-    const models = tracker.models[sessionID]
-    const retries = tracker.stats[sessionID]?.retries ?? 0
-    const cache = cacheText(tracker.stats[sessionID])
-    if (!models) return { rows: [], overflow: 0, retries, cache }
+  /** Fold a session's parent from `session.created`/`session.updated`, or lazily from state.
+   * A successful lookup is cached; an unknown session is retried on the next render. */
+  const resolveParent = (sessionID: string) => {
+    if (sessionID in tracker.parentOf) return
+    const info = api.state.session.get(sessionID)
+    if (!info) return
+    tracker.parentOf[sessionID] = info.parentID
+  }
 
-    const active = models.active
+  const rememberParent = (sessionID: string, parentID: string | undefined) => {
+    if (sessionID in tracker.parentOf && tracker.parentOf[sessionID] === parentID) return
+    tracker.parentOf[sessionID] = parentID
+    bump()
+  }
+
+  const knownSessions = () => {
+    const ids = new Set<string>(Object.keys(tracker.models))
+    for (const id of Object.keys(tracker.stats)) ids.add(id)
+    for (const id of Object.keys(tracker.averages)) ids.add(id)
+    return ids
+  }
+
+  /** Breadth-first descendants of `sessionID` (excluding itself), cycle-safe and capped. */
+  const descendants = (sessionID: string) => {
+    const children = new Map<string, string[]>()
+    for (const [child, parent] of Object.entries(tracker.parentOf)) {
+      if (!parent) continue
+      const siblings = children.get(parent)
+      if (siblings) siblings.push(child)
+      else children.set(parent, [child])
+    }
+
+    const seen = new Set<string>([sessionID])
+    const found: string[] = []
+    const queue = [sessionID]
+    while (queue.length > 0 && found.length < SUBTREE_LIMIT) {
+      const current = queue.shift()!
+      for (const child of children.get(current) ?? []) {
+        if (seen.has(child)) continue
+        seen.add(child)
+        found.push(child)
+        queue.push(child)
+        if (found.length >= SUBTREE_LIMIT) break
+      }
+    }
+    return found
+  }
+
+  const mergeAggregate = (target: ModelAggregate, source: ModelAggregate) => {
+    target.cacheRead += source.cacheRead
+    target.cachePrompt += source.cachePrompt
+    target.cost += source.cost
+    target.steps += source.steps
+    target.totalTokens += source.totalTokens
+    target.totalDurationMs += source.totalDurationMs
+    target.totalTtftMs += source.totalTtftMs
+    target.stepCount += source.stepCount
+    target.lastAt = Math.max(target.lastAt, source.lastAt)
+  }
+
+  const sessionModelAt = (sessionID: string) => {
+    const models = tracker.models[sessionID]
+    if (!models) return 0
+    let at = 0
+    for (const key of models.order) {
+      const aggregate = models.aggregates[key]
+      if (aggregate && aggregate.lastAt > at) at = aggregate.lastAt
+    }
+    return at
+  }
+
+  /** Live rate for a merged row: the parent and its subagents share one row, so only the
+   * session/model pair that most recently saw activity contributes. Concurrent streams in a
+   * parent and a child are therefore approximated by the newer one instead of being summed. */
+  const liveRateFor = (sessions: string[], key: string) => {
+    let latest: { sessionID: string; at: number } | undefined
+    for (const sessionID of sessions) {
+      const aggregate = tracker.models[sessionID]?.aggregates[key]
+      if (!aggregate) continue
+      if (!latest || aggregate.lastAt >= latest.at) latest = { sessionID, at: aggregate.lastAt }
+    }
+    if (!latest) return undefined
+    return sessionLiveRate(latest.sessionID, key)
+  }
+
+  const modelRows = (sessionID: string): ModelPanel => {
+    // Link sessions that only announced themselves through message events (a child can stream
+    // before its `session.created` event is delivered).
+    for (const id of knownSessions()) resolveParent(id)
+
+    const subtree = [sessionID, ...descendants(sessionID)]
+    const retries = tracker.stats[sessionID]?.retries ?? 0
+
+    // Session CACHE uses the same subtree scope as the model rows.
+    let cacheRead = 0
+    let cachePrompt = 0
+    for (const id of subtree) {
+      const stats = tracker.stats[id]
+      if (!stats) continue
+      cacheRead += stats.cacheRead
+      cachePrompt += stats.cachePrompt
+    }
+    const cache = cacheText({ cacheRead, cachePrompt })
+
+    // Fold the subtree oldest→newest so `order` keeps its "oldest first" meaning across sessions.
+    const sessions = subtree
+      .filter((id) => tracker.models[id])
+      .sort((left, right) => sessionModelAt(left) - sessionModelAt(right))
+    if (sessions.length === 0) return { rows: [], overflow: 0, retries, cache }
+
+    const order: string[] = []
+    const aggregates: Record<string, ModelAggregate> = {}
+    const subagentModels = new Set<string>()
+    for (const id of sessions) {
+      const models = tracker.models[id]
+      for (const key of models.order) {
+        const aggregate = models.aggregates[key]
+        if (!aggregate) continue
+        let merged = aggregates[key]
+        if (!merged) {
+          merged = emptyAggregate()
+          aggregates[key] = merged
+          order.push(key)
+        }
+        mergeAggregate(merged, aggregate)
+        if (id !== sessionID) subagentModels.add(key)
+      }
+    }
+
+    let active: string | undefined
+    for (const id of sessions) active = tracker.models[id].active ?? active
+
     // `order` is oldest→newest; reverse for most-recent-first ordering of the non-active rows.
-    const recency = [...models.order].reverse().filter((key) => key in models.aggregates)
-    const ordered =
-      active && active in models.aggregates ? [active, ...recency.filter((key) => key !== active)] : recency
+    const recency = [...order].reverse()
+    const ordered = active && active in aggregates ? [active, ...recency.filter((key) => key !== active)] : recency
 
     const visible = ordered.slice(0, MODEL_ROW_LIMIT)
     const overflow = Math.max(0, ordered.length - visible.length)
 
     const rows = visible.map<ModelRow>((key) => {
-      const aggregate = models.aggregates[key]
+      const aggregate = aggregates[key]
       const isActive = key === active
-      const cost = costText(aggregate)
       return {
         key,
         label: key,
         active: isActive,
-        tps: isActive ? liveRateFor(sessionID, key) : undefined,
+        subagent: subagentModels.has(key),
+        tps: isActive ? liveRateFor(subtree, key) : undefined,
         avg: averageRate(aggregate),
         ttft: averageTtft(aggregate),
         cache: cacheText(aggregate),
-        cost: cost === undefined ? undefined : cost,
+        cost: costText(aggregate),
       }
     })
 
@@ -393,6 +536,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
         tracker.models[sessionID] ?? (tracker.models[sessionID] = { order: [], aggregates: {}, messageModels: new Map() })
       touchModel(models, key)
       models.active = key
+      models.aggregates[key] = { ...models.aggregates[key], lastAt: Date.now() }
       boundedSet(models.messageModels, info.id, key, MESSAGE_MODEL_LIMIT)
 
       if (!info.time.completed) {
@@ -524,6 +668,19 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
   listeners.push(
     api.event.on("session.idle", (event) => {
       clearTimings(event.properties.sessionID)
+    }),
+  )
+
+  // Subagent sessions announce their parent here; the tree is also backfilled lazily from state.
+  listeners.push(
+    api.event.on("session.created", (event) => {
+      rememberParent(event.properties.info.id, event.properties.info.parentID)
+    }),
+  )
+
+  listeners.push(
+    api.event.on("session.updated", (event) => {
+      rememberParent(event.properties.info.id, event.properties.info.parentID)
     }),
   )
 

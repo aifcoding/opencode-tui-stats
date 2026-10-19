@@ -9,7 +9,40 @@ import {
   type TrackerHandle,
 } from "./tracker"
 
-/** A single model row: fold marker + summary line, plus a detail line when expanded. */
+/** Detail lines sit three cells in from the fold marker, visually owned by the row above. */
+const DETAIL_INDENT = "   "
+/** Fixed cells keep every label on the same column across rows without measuring the panel. */
+const RATE_CELL = 4
+const TTFT_CELL = 6
+const CACHE_CELL = 4
+
+/** Split `provider/model` so the provider can be muted. Model ids may contain slashes, so only the
+ * first slash separates the provider. When the model already starts with the provider name
+ * (`deepseek/deepseek-flash`) the redundant prefix is dropped. */
+function splitLabel(label: string) {
+  const slash = label.indexOf("/")
+  if (slash <= 0) return { provider: "", model: label }
+  const provider = label.slice(0, slash)
+  const model = label.slice(slash + 1)
+  if (model.toLowerCase().startsWith(provider.toLowerCase())) return { provider: "", model }
+  return { provider: `${provider}/`, model }
+}
+
+function rateCell(value: string | undefined) {
+  return value === undefined ? "—" : `${value.padStart(RATE_CELL)}t/s`
+}
+
+function ttftCell(value: string | undefined) {
+  return (value ?? "—").padEnd(TTFT_CELL)
+}
+
+function cacheCell(value: string | undefined) {
+  if (value === undefined) return "—".padStart(CACHE_CELL)
+  const percent = value.endsWith("%") ? value.slice(0, -1) : value
+  return `${percent.padStart(3)}%`
+}
+
+/** A single model row: fold marker + summary line, plus its detail lines when expanded. */
 function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boolean; onToggle: () => void }) {
   // Guard against a drag-select being read as a click: only toggle when the press and the
   // release land on the same cell.
@@ -27,29 +60,37 @@ function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boole
   }
 
   const theme = () => props.api.theme.current
+  const parts = () => splitLabel(props.row.label)
 
   return (
     <box flexDirection="column" onMouseDown={handleMouseDown} onMouseUp={handleMouseUp}>
       <text wrapMode="none" truncate>
         <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{`${props.expanded ? "▼" : "▶"} `}</span>
-        <span style={{ fg: theme().text } as Record<string, unknown>}>{props.row.label}</span>
-        <Show when={props.row.active}>
-          <span style={{ fg: theme().success } as Record<string, unknown>}>{"   active"}</span>
+        <Show when={props.row.subagent}>
+          <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{"↳ "}</span>
         </Show>
+        <Show when={parts().provider}>
+          <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{parts().provider}</span>
+        </Show>
+        <span style={{ fg: theme().text } as Record<string, unknown>}>{parts().model}</span>
       </text>
       <Show when={props.expanded}>
         <text fg={theme().text} wrapMode="none" truncate>
-          {`TPS ${props.row.tps ?? "—"} · AVG ${props.row.avg ?? "—"}`}
+          {`${DETAIL_INDENT}AVG ${rateCell(props.row.avg)}${
+            props.row.tps === undefined ? "" : ` · TPS ${rateCell(props.row.tps)}`
+          }`}
         </text>
         <text fg={theme().text} wrapMode="none" truncate>
-          {`TTFT ${props.row.ttft ?? "—"} · CACHE ${props.row.cache ?? "—"} · ${props.row.cost ?? "—"}`}
+          {`${DETAIL_INDENT}TTFT ${ttftCell(props.row.ttft)} · CACHE ${cacheCell(props.row.cache)} · ${
+            props.row.cost ?? "—"
+          }`}
         </text>
       </Show>
     </box>
   )
 }
 
-/** Per-session model panel, mounted at `sidebar_content`. */
+/** Per-session model panel, mounted at `sidebar_footer`. */
 function ModelPanelView(props: {
   api: TuiPluginApi
   sessionID: string
@@ -112,9 +153,13 @@ function ModelPanelView(props: {
 
   return (
     <box flexDirection="column">
-      <text fg={props.api.theme.current.textMuted}>Performance · observed</text>
+      <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+        Performance · observed
+      </text>
       <Show when={panel().rows.length === 0}>
-        <text fg={props.api.theme.current.textMuted}>—</text>
+        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+          —
+        </text>
       </Show>
       <For each={panel().rows}>
         {(row) => (
@@ -122,9 +167,11 @@ function ModelPanelView(props: {
         )}
       </For>
       <Show when={panel().overflow > 0}>
-        <text fg={props.api.theme.current.textMuted}>{`+${panel().overflow} more models`}</text>
+        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+          {`+${panel().overflow} more models`}
+        </text>
       </Show>
-      <text fg={props.api.theme.current.text}>
+      <text fg={props.api.theme.current.text} wrapMode="none" truncate>
         {`Session CACHE ${panel().cache ?? "—"}${panel().retries > 0 ? ` · retries ${panel().retries}` : ""}`}
       </text>
     </box>
@@ -139,7 +186,7 @@ const tui: TuiPlugin = async (api) => {
 
   api.slots.register({
     slots: {
-      sidebar_content(_context, props) {
+      sidebar_footer(_context, props) {
         return <ModelPanelView api={api} sessionID={props.session_id} tracker={tracker} revision={revision} />
       },
     },
