@@ -449,7 +449,7 @@ test("cache hit rate and cost accumulate from a completed step", async () => {
 
   await harness.renderOnce()
   const frame = harness.frame()
-  expect(frame).toContain("CACHE  31%")
+  expect(frame).toContain("CACHE  30.7%")
   expect(frame).toContain("$0.0073")
   expect(frame).not.toContain("retries")
 
@@ -508,8 +508,8 @@ test("expanded rows align metric columns and omit idle TPS", async () => {
   expect(new Set(avgLines.map((line) => line.indexOf("AVG "))).size).toBe(1)
   expect(new Set(detailLines.map((line) => line.indexOf("CACHE "))).size).toBe(1)
   expect(new Set(detailLines.map((line) => line.indexOf("$"))).size).toBe(1)
-  expect(detailLines.some((line) => line.includes("CACHE   0%"))).toBe(true)
-  expect(detailLines.some((line) => line.includes("CACHE 100%"))).toBe(true)
+  expect(detailLines.some((line) => line.includes("CACHE   0.0%"))).toBe(true)
+  expect(detailLines.some((line) => line.includes("CACHE 100.0%"))).toBe(true)
   expect(detailLines.some((line) => line.includes("$0.0073"))).toBe(true)
   expect(detailLines.some((line) => line.includes("$0.6500"))).toBe(true)
 })
@@ -602,7 +602,7 @@ test("re-emitting a completed message does not accumulate twice", async () => {
 
   await harness.renderOnce()
   const frame = harness.frame()
-  expect(frame).toContain("CACHE  31%")
+  expect(frame).toContain("CACHE  30.7%")
   expect(frame).toContain("$0.0073")
 })
 
@@ -967,8 +967,8 @@ test("session CACHE aggregates the whole subtree", async () => {
 
   await harness.renderOnce()
   const frame = harness.frame()
-  expect(frame).toContain("CACHE 80%")
-  expect(frame).toContain("Session CACHE 80%")
+  expect(frame).toContain("CACHE 80.0%")
+  expect(frame).toContain("Session CACHE 80.0%")
 })
 
 test("a child session observed only through state is linked lazily", async () => {

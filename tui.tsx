@@ -14,10 +14,10 @@ const DETAIL_INDENT = "   "
 /** Fixed cells keep every label on the same column across rows without measuring the panel. */
 const RATE_CELL = 4
 const TTFT_CELL = 6
-const CACHE_CELL = 4
+const CACHE_CELL = 6
 
-/** Split `provider/model` so the provider can be muted. Model ids may contain slashes, so only the
- * first slash separates the provider. When the model already starts with the provider name
+/** Split `provider/model` so the provider can be de-emphasised. Model ids may contain slashes, so
+ * only the first slash separates the provider. When the model already starts with the provider name
  * (`deepseek/deepseek-flash`) the redundant prefix is dropped. */
 function splitLabel(label: string) {
   const slash = label.indexOf("/")
@@ -39,7 +39,7 @@ function ttftCell(value: string | undefined) {
 function cacheCell(value: string | undefined) {
   if (value === undefined) return "—".padStart(CACHE_CELL)
   const percent = value.endsWith("%") ? value.slice(0, -1) : value
-  return `${percent.padStart(3)}%`
+  return `${percent.padStart(5)}%`
 }
 
 /** A single model row: fold marker + summary line, plus its detail lines when expanded. */
@@ -70,7 +70,9 @@ function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boole
           <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{"↳ "}</span>
         </Show>
         <Show when={parts().provider}>
-          <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{parts().provider}</span>
+          {/* Dimmed foreground sits between the model name and muted metadata without borrowing
+           * a status colour, so the provider reads as its own tier even as themes change. */}
+          <span style={{ fg: theme().text, dim: true } as Record<string, unknown>}>{parts().provider}</span>
         </Show>
         <span style={{ fg: theme().text } as Record<string, unknown>}>{parts().model}</span>
       </text>

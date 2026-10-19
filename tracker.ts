@@ -147,7 +147,7 @@ export function averageTtft(average: SessionAverage | undefined) {
 /** Cache hit percentage (e.g. `31%`) or `undefined` when nothing promptable has been seen. */
 export function cacheText(stats: { cacheRead: number; cachePrompt: number } | undefined) {
   if (!stats || stats.cachePrompt <= 0) return undefined
-  return `${Math.round((stats.cacheRead / stats.cachePrompt) * 100)}%`
+  return `${((stats.cacheRead / stats.cachePrompt) * 100).toFixed(1)}%`
 }
 
 export function costText(stats: { cost: number; steps: number } | undefined) {
