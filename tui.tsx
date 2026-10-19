@@ -75,12 +75,12 @@ function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boole
         <span style={{ fg: theme().text } as Record<string, unknown>}>{parts().model}</span>
       </text>
       <Show when={props.expanded}>
-        <text fg={theme().text} wrapMode="none" truncate>
+        <text fg={theme().textMuted} wrapMode="none" truncate>
           {`${DETAIL_INDENT}AVG ${rateCell(props.row.avg)}${
             props.row.tps === undefined ? "" : ` · TPS ${rateCell(props.row.tps)}`
           }`}
         </text>
-        <text fg={theme().text} wrapMode="none" truncate>
+        <text fg={theme().textMuted} wrapMode="none" truncate>
           {`${DETAIL_INDENT}TTFT ${ttftCell(props.row.ttft)} · CACHE ${cacheCell(props.row.cache)} · ${
             props.row.cost ?? "—"
           }`}
@@ -153,8 +153,8 @@ function ModelPanelView(props: {
 
   return (
     <box flexDirection="column">
-      <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-        Performance · observed
+      <text fg={props.api.theme.current.text} wrapMode="none" truncate>
+        <b>Performance · observed</b>
       </text>
       <Show when={panel().rows.length === 0}>
         <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
@@ -171,7 +171,7 @@ function ModelPanelView(props: {
           {`+${panel().overflow} more models`}
         </text>
       </Show>
-      <text fg={props.api.theme.current.text} wrapMode="none" truncate>
+      <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
         {`Session CACHE ${panel().cache ?? "—"}${panel().retries > 0 ? ` · retries ${panel().retries}` : ""}`}
       </text>
     </box>
