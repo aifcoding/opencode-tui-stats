@@ -53,6 +53,9 @@ export type SessionModels = {
   aggregates: Record<string, ModelAggregate>
   /** `messageID -> providerID/modelID`, used to attribute live samples to a model. */
   messageModels: Map<string, string>
+  /** Last measured live rate per model key, kept after the stream goes idle/stale so the
+   * final reading stays visible instead of disappearing. */
+  lastRate: Record<string, string>
 }
 
 export type Tracker = {
@@ -182,7 +185,10 @@ export type ModelRow = {
   active: boolean
   /** True when any descendant (subagent) session contributed data to this row. */
   subagent?: boolean
+  /** Last measured live rate, or `undefined` when this model has never streamed. */
   tps?: string
+  /** True while `tps` is backed by an active stream; false for a frozen final value. */
+  tpsLive: boolean
   avg?: string
   ttft?: string
   cache?: string
@@ -323,10 +329,13 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     bump()
   }
 
-  /** Live rate restricted to samples attributed to `key` via the `messageID -> model` mapping. */
-  const sessionLiveRate = (sessionID: string, key: string) => {
+  /** Live rate restricted to samples attributed to `key` via the `messageID -> model` mapping.
+   * When the session is idle or the samples are stale, the last measured value is frozen and
+   * returned with `live: false` instead of disappearing. */
+  const sessionLiveRate = (sessionID: string, key: string): { value?: string; live: boolean } => {
+    const frozen = { value: tracker.models[sessionID]?.lastRate[key], live: false }
     const status = api.state.session.status(sessionID)
-    if (!status || status.type === "idle") return undefined
+    if (!status || status.type === "idle") return frozen
 
     const now = Date.now()
     const mapping = tracker.models[sessionID]?.messageModels
@@ -334,10 +343,14 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
       (sample) => now - sample.at <= STREAM_WINDOW_MS && mapping?.get(sample.messageID) === key,
     )
     const last = samples[samples.length - 1]
-    if (!last || now - last.at > LIVE_STALE_MS) return undefined
+    if (!last || now - last.at > LIVE_STALE_MS) return frozen
 
     const tokens = samples.reduce((sum, sample) => sum + sample.tokens, 0)
-    return formatRate(tokens / (activeDuration(samples, now) / 1_000))
+    const value = formatRate(tokens / (activeDuration(samples, now) / 1_000))
+    if (value === undefined) return frozen
+    const models = tracker.models[sessionID]
+    if (models) models.lastRate[key] = value
+    return { value, live: true }
   }
 
   /** Fold a session's parent from `session.created`/`session.updated`, or lazily from state.
@@ -414,14 +427,14 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
   /** Live rate for a merged row: the parent and its subagents share one row, so only the
    * session/model pair that most recently saw activity contributes. Concurrent streams in a
    * parent and a child are therefore approximated by the newer one instead of being summed. */
-  const liveRateFor = (sessions: string[], key: string) => {
+  const liveRateFor = (sessions: string[], key: string): { value?: string; live: boolean } => {
     let latest: { sessionID: string; at: number } | undefined
     for (const sessionID of sessions) {
       const aggregate = tracker.models[sessionID]?.aggregates[key]
       if (!aggregate) continue
       if (!latest || aggregate.lastAt >= latest.at) latest = { sessionID, at: aggregate.lastAt }
     }
-    if (!latest) return undefined
+    if (!latest) return { live: false }
     return sessionLiveRate(latest.sessionID, key)
   }
 
@@ -482,12 +495,14 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     const rows = visible.map<ModelRow>((key) => {
       const aggregate = aggregates[key]
       const isActive = key === active
+      const tps = isActive ? liveRateFor(subtree, key) : { value: undefined, live: false }
       return {
         key,
         label: key,
         active: isActive,
         subagent: subagentModels.has(key),
-        tps: isActive ? liveRateFor(subtree, key) : undefined,
+        tps: tps.value,
+        tpsLive: tps.live,
         avg: averageRate(aggregate),
         ttft: averageTtft(aggregate),
         cache: cacheText(aggregate),
@@ -533,7 +548,8 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
       // Observe the model as soon as a message appears so the sidebar can attribute live samples
       // and mark the most recently used model as active.
       const models =
-        tracker.models[sessionID] ?? (tracker.models[sessionID] = { order: [], aggregates: {}, messageModels: new Map() })
+        tracker.models[sessionID] ??
+        (tracker.models[sessionID] = { order: [], aggregates: {}, messageModels: new Map(), lastRate: {} })
       touchModel(models, key)
       models.active = key
       models.aggregates[key] = { ...models.aggregates[key], lastAt: Date.now() }

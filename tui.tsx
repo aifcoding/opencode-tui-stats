@@ -65,6 +65,9 @@ function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boole
   return (
     <box flexDirection="column" onMouseDown={handleMouseDown} onMouseUp={handleMouseUp}>
       <text wrapMode="none" truncate>
+        {/* The most recently used model gets a green dot; other rows keep a blank slot so
+         * names stay aligned without spending extra width on a second marker. */}
+        <span style={{ fg: theme().success } as Record<string, unknown>}>{props.row.active ? "● " : "  "}</span>
         <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{`${props.expanded ? "▼" : "▶"} `}</span>
         <Show when={props.row.subagent}>
           <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{"↳ "}</span>
@@ -78,14 +81,23 @@ function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boole
       </text>
       <Show when={props.expanded}>
         <text fg={theme().textMuted} wrapMode="none" truncate>
-          {`${DETAIL_INDENT}AVG ${rateCell(props.row.avg)}${
-            props.row.tps === undefined ? "" : ` · TPS ${rateCell(props.row.tps)}`
-          }`}
+          <span style={{ fg: theme().textMuted } as Record<string, unknown>}>
+            {`${DETAIL_INDENT}AVG ${rateCell(props.row.avg)}`}
+          </span>
+          <Show when={props.row.tps !== undefined}>
+            <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{" · TPS "}</span>
+            {/* A frozen final reading stays visible but is dimmed to distinguish it from a
+             * value backed by an active stream. */}
+            <span style={{ fg: theme().textMuted, dim: !props.row.tpsLive } as Record<string, unknown>}>
+              {rateCell(props.row.tps)}
+            </span>
+          </Show>
         </text>
         <text fg={theme().textMuted} wrapMode="none" truncate>
-          {`${DETAIL_INDENT}TTFT ${ttftCell(props.row.ttft)} · CACHE ${cacheCell(props.row.cache)} · ${
-            props.row.cost ?? "—"
-          }`}
+          {`${DETAIL_INDENT}TTFT ${ttftCell(props.row.ttft)} · CACHE ${cacheCell(props.row.cache)}`}
+        </text>
+        <text fg={theme().textMuted} wrapMode="none" truncate>
+          {`${DETAIL_INDENT}${props.row.cost ?? "—"}`}
         </text>
       </Show>
     </box>

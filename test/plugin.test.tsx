@@ -1,5 +1,5 @@
 import { afterEach, expect, setSystemTime, test } from "bun:test"
-import { RGBA } from "@opentui/core"
+import { RGBA, TextAttributes } from "@opentui/core"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import { render, type JSX } from "@opentui/solid"
 import type { TuiPluginApi, TuiPluginMeta, TuiRouteCurrent } from "@opencode-ai/plugin/tui"
@@ -35,6 +35,7 @@ type Harness = {
   setRoute(route: TuiRouteCurrent): void
   renderOnce(): Promise<void>
   frame(): string
+  spans(): ReturnType<TestRendererSetup["captureSpans"]>
   subscriptionCount(): number
   partLookups(): number
   sessionLookups(): number
@@ -241,6 +242,9 @@ async function createHarness(): Promise<Harness> {
     frame() {
       return screen.captureCharFrame()
     },
+    spans() {
+      return screen.captureSpans()
+    },
     subscriptionCount() {
       return subscriptions.size
     },
@@ -277,6 +281,8 @@ function completeMessage(
     cost?: number
     providerID?: string
     modelID?: string
+    /** Emit a streaming delta (default true). Set false to leave no TPS history behind. */
+    stream?: boolean
   } = {},
 ) {
   const messageID = options.id ?? `${sessionID}-message`
@@ -296,14 +302,16 @@ function completeMessage(
     }),
   })
 
-  setSystemTime(base + 500)
-  harness.emit("message.part.delta", {
-    sessionID,
-    messageID,
-    partID,
-    field: "text",
-    delta: "x".repeat(25),
-  })
+  if (options.stream !== false) {
+    setSystemTime(base + 500)
+    harness.emit("message.part.delta", {
+      sessionID,
+      messageID,
+      partID,
+      field: "text",
+      delta: "x".repeat(25),
+    })
+  }
 
   setSystemTime(base + 2_500)
   harness.emit("message.updated", {
@@ -401,6 +409,65 @@ test("streaming deltas produce a live TPS reading", async () => {
   expect(harness.frame()).toContain("TPS 10.0")
 })
 
+test("finished session keeps the last live TPS reading, dimmed", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  const sessionID = "one"
+  const messageID = "message"
+  const partID = "part"
+  harness.setStatus(sessionID, { type: "busy" })
+  harness.setParts(messageID, [textPart(partID, messageID, sessionID)])
+
+  setSystemTime(base)
+  harness.emit("message.updated", {
+    sessionID,
+    info: assistantMessage({ id: messageID, sessionID, created: base }),
+  })
+  for (let index = 0; index < 2; index++) {
+    harness.emit("message.part.delta", {
+      sessionID,
+      messageID,
+      partID,
+      field: "text",
+      delta: "x".repeat(25),
+    })
+  }
+
+  // The first render observes and remembers the live reading.
+  await harness.renderOnce()
+  const live = harness.spans().lines.flatMap((line) => line.spans).find((span) => span.text.includes("10.0t/s"))
+  expect(live).toBeDefined()
+  expect(live!.attributes & TextAttributes.DIM).toBe(0)
+
+  // Once idle, the same value must remain visible (frozen) and be marked non-live.
+  setSystemTime(base + 60_000)
+  harness.setStatus(sessionID, { type: "idle" })
+  harness.emit("session.idle", { sessionID })
+  await harness.renderOnce()
+
+  const frame = harness.frame()
+  expect(frame).toContain("TPS 10.0t/s")
+  const frozen = harness.spans().lines.flatMap((line) => line.spans).find((span) => span.text.includes("10.0t/s"))
+  expect(frozen).toBeDefined()
+  expect(frozen!.attributes & TextAttributes.DIM).not.toBe(0)
+})
+
+test("a model that never streamed renders no TPS field", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  harness.setStatus("one", { type: "busy" })
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "never-streamed", sessionID: "one", created: 1_700_000_000_000 }),
+  })
+
+  await harness.renderOnce()
+  expect(harness.frame()).not.toContain("TPS")
+})
+
 test("finished message accumulates AVG and TTFT", async () => {
   const harness = await createHarness()
   activeHarness = harness
@@ -475,6 +542,7 @@ test("expanded rows align metric columns and omit idle TPS", async () => {
     cacheRead: 0,
     cost: 0.007337112,
     output: 20,
+    stream: false,
   })
   completeMessage(harness, "one", base + 100_000, {
     id: "one-message-2",
@@ -484,6 +552,7 @@ test("expanded rows align metric columns and omit idle TPS", async () => {
     cacheRead: 1_000,
     cost: 0.65,
     output: 20,
+    stream: false,
   })
 
   // The active row ("other") starts expanded; open the older row as well.
@@ -494,7 +563,10 @@ test("expanded rows align metric columns and omit idle TPS", async () => {
   expect(frame).toContain("▼ deepseek-flash")
   expect(frame).not.toContain("deepseek/deepseek-flash")
   expect(frame).toContain("deepseek/other")
-  // Idle rows never render an empty TPS field.
+  // Only the active model row carries the green dot.
+  expect(frame).toContain("● ▼ deepseek/other")
+  expect(frame).not.toContain("● ▼ deepseek-flash")
+  // Neither model was ever observed streaming, so no TPS history exists.
   expect(frame).not.toContain("TPS")
 
   const avgLines = frame.split("\n").filter((line) => line.includes("AVG "))
@@ -507,11 +579,14 @@ test("expanded rows align metric columns and omit idle TPS", async () => {
   // The same field starts on the same column even when the percentage width changes.
   expect(new Set(avgLines.map((line) => line.indexOf("AVG "))).size).toBe(1)
   expect(new Set(detailLines.map((line) => line.indexOf("CACHE "))).size).toBe(1)
-  expect(new Set(detailLines.map((line) => line.indexOf("$"))).size).toBe(1)
+  // The cost moved to its own line; it still aligns across rows.
+  const costLines = frame.split("\n").filter((line) => line.includes("$"))
+  expect(costLines).toHaveLength(2)
+  expect(new Set(costLines.map((line) => line.indexOf("$"))).size).toBe(1)
   expect(detailLines.some((line) => line.includes("CACHE   0.0%"))).toBe(true)
   expect(detailLines.some((line) => line.includes("CACHE 100.0%"))).toBe(true)
-  expect(detailLines.some((line) => line.includes("$0.0073"))).toBe(true)
-  expect(detailLines.some((line) => line.includes("$0.6500"))).toBe(true)
+  expect(frame).toContain("$0.0073")
+  expect(frame).toContain("$0.6500")
 })
 
 test("retry count follows the reported attempt number", async () => {
