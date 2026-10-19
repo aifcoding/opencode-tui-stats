@@ -2,12 +2,13 @@ import { afterEach, expect, setSystemTime, test } from "bun:test"
 import { RGBA } from "@opentui/core"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import { render, type JSX } from "@opentui/solid"
-import type { TuiPluginApi, TuiPluginMeta } from "@opencode-ai/plugin/tui"
+import type { TuiPluginApi, TuiPluginMeta, TuiRouteCurrent } from "@opencode-ai/plugin/tui"
 import type { Message, Part, SessionStatus, ToolPart } from "@opencode-ai/sdk/v2"
-import { batch, createSignal } from "solid-js"
+import { batch, createSignal, Show } from "solid-js"
 import type { TrackerInternals } from "../tracker"
 
 const { default: plugin } = await import("../tui")
+const { getLastPanelController } = await import("../tracker")
 const { getLastInternals } = await import("../tracker")
 
 function internals(): TrackerInternals {
@@ -16,7 +17,13 @@ function internals(): TrackerInternals {
   return value
 }
 
-type SlotRender = (context: unknown, props: { session_id: string }) => JSX.Element
+function controller() {
+  const value = getLastPanelController()
+  if (!value) throw new Error("panel controller was not initialized")
+  return value
+}
+
+type SidebarRender = (context: unknown, props: { session_id: string }) => JSX.Element
 type Listener = (event: unknown) => void
 
 type Harness = {
@@ -24,10 +31,13 @@ type Harness = {
   setStatus(sessionID: string, status: SessionStatus | undefined): void
   setParts(messageID: string, value: Part[]): void
   switchSession(sessionID: string): void
+  setRoute(route: TuiRouteCurrent): void
   renderOnce(): Promise<void>
   frame(): string
   subscriptionCount(): number
   partLookups(): number
+  renderRequests(): number
+  controller(): ReturnType<typeof controller>
   dispose(): Promise<void>
 }
 
@@ -67,6 +77,8 @@ function assistantMessage(input: {
   cacheWrite?: number
   cost?: number
   finish?: string
+  providerID?: string
+  modelID?: string
 }): Message {
   return {
     id: input.id,
@@ -74,8 +86,8 @@ function assistantMessage(input: {
     role: "assistant",
     time: input.completed === undefined ? { created: input.created } : { created: input.created, completed: input.completed },
     parentID: "user-message",
-    modelID: "model",
-    providerID: "provider",
+    modelID: input.modelID ?? "model",
+    providerID: input.providerID ?? "provider",
     mode: "normal",
     agent: "build",
     path: { cwd: "/", root: "/" },
@@ -91,15 +103,17 @@ function assistantMessage(input: {
 }
 
 async function createHarness(): Promise<Harness> {
-  const screen: TestRendererSetup = await createTestRenderer({ width: 120, height: 4 })
+  const screen: TestRendererSetup = await createTestRenderer({ width: 120, height: 24 })
   const listeners = new Map<string, Set<Listener>>()
   const subscriptions = new Set<() => void>()
   const statuses = new Map<string, SessionStatus>()
   const parts = new Map<string, Part[]>()
   const disposeHandlers: Array<() => void | Promise<void>> = []
-  let slotRender: SlotRender | undefined
+  const [routeState, setRouteState] = createSignal<TuiRouteCurrent>({ name: "session", params: { sessionID: "one" } })
+  let sidebarRender: SidebarRender | undefined
   let disposed = false
   let partLookups = 0
+  let renderRequests = 0
 
   const api = {
     event: {
@@ -123,10 +137,17 @@ async function createHarness(): Promise<Harness> {
         return parts.get(messageID) ?? []
       },
     },
+    route: {
+      register: () => () => {},
+      navigate: () => {},
+      get current() {
+        return routeState()
+      },
+    },
     slots: {
       register(registered: { slots?: Record<string, unknown> }) {
-        const candidate = registered.slots?.session_prompt_right
-        if (typeof candidate === "function") slotRender = candidate as SlotRender
+        const slots = registered.slots ?? {}
+        if (typeof slots.sidebar_content === "function") sidebarRender = slots.sidebar_content as SidebarRender
         return "opencode-tui-stats"
       },
     },
@@ -137,17 +158,39 @@ async function createHarness(): Promise<Harness> {
         return () => {}
       },
     },
-    theme: { current: { textMuted: RGBA.fromHex("#8a8a8a") } },
-    renderer: { requestRender: () => {} },
+    theme: {
+      current: {
+        textMuted: RGBA.fromHex("#8a8a8a"),
+        text: RGBA.fromHex("#ffffff"),
+        warning: RGBA.fromHex("#ffaa00"),
+        success: RGBA.fromHex("#00ff00"),
+      },
+    },
+    renderer: {
+      requestRender: () => {
+        renderRequests += 1
+      },
+      width: 120,
+    },
   } as unknown as TuiPluginApi
 
   await plugin.tui(api, undefined, undefined as unknown as TuiPluginMeta)
 
-  const [currentSession, setCurrentSession] = createSignal("one")
-  await render(() => {
-    if (!slotRender) throw new Error("session_prompt_right slot was not registered")
-    return slotRender({ theme: api.theme }, { get session_id() { return currentSession() } })
-  }, screen.renderer)
+  const routeSession = () => {
+    const current = routeState()
+    return current.name === "session" ? (current as { params: { sessionID: string } }).params.sessionID : undefined
+  }
+
+  await render(
+    () => (
+      <box flexDirection="column" width={120}>
+        <Show when={routeState().name === "session"}>
+          {sidebarRender!({ theme: api.theme }, { get session_id() { return routeSession() ?? "" } })}
+        </Show>
+      </box>
+    ),
+    screen.renderer,
+  )
 
   return {
     emit(type, properties) {
@@ -161,7 +204,10 @@ async function createHarness(): Promise<Harness> {
       parts.set(messageID, value)
     },
     switchSession(sessionID) {
-      setCurrentSession(sessionID)
+      setRouteState({ name: "session", params: { sessionID } })
+    },
+    setRoute(route) {
+      setRouteState(route)
     },
     renderOnce() {
       return screen.renderOnce()
@@ -175,6 +221,10 @@ async function createHarness(): Promise<Harness> {
     partLookups() {
       return partLookups
     },
+    renderRequests() {
+      return renderRequests
+    },
+    controller,
     async dispose() {
       if (disposed) return
       disposed = true
@@ -215,7 +265,45 @@ test("empty session renders the placeholder row", async () => {
   activeHarness = harness
   harness.setStatus("one", { type: "busy" })
   await harness.renderOnce()
-  expect(harness.frame()).toContain("TPS - | AVG - | TTFT - | CACHE - | COST - | RETRY 0")
+  const frame = harness.frame()
+  expect(frame).toContain("Performance · observed")
+  expect(frame).toContain("Session CACHE —")
+  expect(frame).not.toContain("retries")
+})
+
+test("model rows default to collapsed except the active model", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "a", sessionID: "one", created: 1, providerID: "provider", modelID: "a" }),
+  })
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "b", sessionID: "one", created: 2, providerID: "provider", modelID: "b" }),
+  })
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(internals().activeModel("one")).toBe("provider/b")
+  expect(frame).toContain("▼ provider/b")
+  expect(frame).toContain("▶ provider/a")
+  expect(harness.controller().isExpanded("provider/b")).toBe(true)
+  expect(harness.controller().isExpanded("provider/a")).toBe(false)
+  // Only the active row contributes a detail line.
+  expect((frame.match(/TTFT /g) ?? []).length).toBe(1)
+})
+
+test("sidebar panel renders nothing on a non-session route", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+  completeStep(harness, "one", 1_700_000_000_000, 20)
+  harness.setRoute({ name: "home" })
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(frame).not.toContain("TPS")
+  expect(frame).not.toContain("Performance")
 })
 
 test("streaming deltas produce a live TPS reading", async () => {
@@ -223,6 +311,10 @@ test("streaming deltas produce a live TPS reading", async () => {
   activeHarness = harness
   harness.setStatus("one", { type: "busy" })
   harness.setParts("message", [textPart("part", "message", "one")])
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "message", sessionID: "one", created: 1_700_000_000_000 }),
+  })
 
   for (let index = 0; index < 2; index++) {
     harness.emit("message.part.delta", {
@@ -245,7 +337,9 @@ test("finished message accumulates AVG and TTFT", async () => {
   completeStep(harness, "one", 1_700_000_000_000, 20)
 
   await harness.renderOnce()
-  expect(harness.frame()).toContain("TPS - | AVG 10.0 | TTFT 0.5s")
+  const frame = harness.frame()
+  expect(frame).toContain("AVG 10.0")
+  expect(frame).toContain("TTFT 0.5s")
 })
 
 test("cache hit rate and cost accumulate from a completed step", async () => {
@@ -285,7 +379,8 @@ test("cache hit rate and cost accumulate from a completed step", async () => {
   await harness.renderOnce()
   const frame = harness.frame()
   expect(frame).toContain("CACHE 31%")
-  expect(frame).toContain("COST $0.0073")
+  expect(frame).toContain("$0.0073")
+  expect(frame).not.toContain("retries")
 })
 
 test("retry count follows the reported attempt number", async () => {
@@ -293,21 +388,24 @@ test("retry count follows the reported attempt number", async () => {
   activeHarness = harness
 
   const sessionID = "one"
+  await harness.renderOnce()
+  expect(harness.frame()).not.toContain("retries")
+
   harness.emit("session.status", { sessionID, status: { type: "retry", attempt: 1, message: "rate limited", next: 0 } })
   harness.emit("session.status", { sessionID, status: { type: "retry", attempt: 2, message: "rate limited", next: 0 } })
   await harness.renderOnce()
-  expect(harness.frame()).toContain("RETRY 2")
+  expect(harness.frame()).toContain("Session CACHE — · retries 2")
   expect(internals().retries(sessionID)).toBe(2)
 
   // A non-retry status resets the baseline, so the next burst counts from 0 again.
   harness.emit("session.status", { sessionID, status: { type: "busy" } })
   await harness.renderOnce()
-  expect(harness.frame()).toContain("RETRY 2")
+  expect(harness.frame()).toContain("Session CACHE — · retries 2")
 
   harness.emit("session.status", { sessionID, status: { type: "retry", attempt: 1, message: "rate limited", next: 0 } })
   harness.emit("session.status", { sessionID, status: { type: "retry", attempt: 2, message: "rate limited", next: 0 } })
   await harness.renderOnce()
-  expect(harness.frame()).toContain("RETRY 4")
+  expect(harness.frame()).toContain("Session CACHE — · retries 4")
   expect(internals().retries(sessionID)).toBe(4)
 })
 
@@ -318,16 +416,16 @@ test("switching sessions keeps each session's accumulated totals", async () => {
   harness.switchSession("one")
   completeStep(harness, "one", 1_700_000_000_000, 20)
   await harness.renderOnce()
-  expect(harness.frame()).toContain("AVG 10.0 | TTFT 0.5s")
+  expect(harness.frame()).toContain("AVG 10.0")
 
   harness.switchSession("two")
   completeStep(harness, "two", 1_700_000_100_000, 60)
   await harness.renderOnce()
-  expect(harness.frame()).toContain("AVG 30.0 | TTFT 0.5s")
+  expect(harness.frame()).toContain("AVG 30.0")
 
   harness.switchSession("one")
   await harness.renderOnce()
-  expect(harness.frame()).toContain("AVG 10.0 | TTFT 0.5s")
+  expect(harness.frame()).toContain("AVG 10.0")
 })
 
 test("disposing unsubscribes every event listener", async () => {
@@ -374,7 +472,7 @@ test("re-emitting a completed message does not accumulate twice", async () => {
   await harness.renderOnce()
   const frame = harness.frame()
   expect(frame).toContain("CACHE 31%")
-  expect(frame).toContain("COST $0.0073")
+  expect(frame).toContain("$0.0073")
 })
 
 test("delta classification is cached per part and rejects non-text parts", async () => {
@@ -382,6 +480,10 @@ test("delta classification is cached per part and rejects non-text parts", async
   activeHarness = harness
   harness.setStatus("one", { type: "busy" })
   harness.setParts("m", [textPart("p-text", "m", "one"), reasoningPart("p-reason", "m", "one")])
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "m", sessionID: "one", created: 1_700_000_000_000 }),
+  })
 
   const before = harness.partLookups()
   harness.emit("message.part.delta", { sessionID: "one", messageID: "m", partID: "p-text", field: "text", delta: "x".repeat(25) })
@@ -409,7 +511,9 @@ test("delta classification is cached per part and rejects non-text parts", async
   expect(internals().partDecision("p-step")).toBe(false)
 
   await harness.renderOnce()
-  expect(harness.frame()).not.toContain("TPS -")
+  // Accepted text/reasoning deltas still produce a live reading (never the "—" placeholder).
+  expect(harness.frame()).toMatch(/TPS \d/)
+  expect(harness.frame()).not.toContain("TPS —")
 })
 
 test("internal caches stay bounded under sustained traffic", async () => {
@@ -464,7 +568,7 @@ test("the mounted session survives eviction of background sessions", async () =>
   expect(internals().hasStats("one")).toBe(true)
 
   await harness.renderOnce()
-  expect(harness.frame()).toContain("AVG 10.0 | TTFT 0.5s")
+  expect(harness.frame()).toContain("AVG 10.0")
 })
 
 test("dedup window covers the most recent 64 completed messages per session", async () => {
@@ -483,17 +587,17 @@ test("dedup window covers the most recent 64 completed messages per session", as
   expect(internals().dedupSize(sessionID)).toBe(64)
   expect(internals().hasStats(sessionID)).toBe(true)
   await harness.renderOnce()
-  expect(harness.frame()).toContain("COST $0.6500")
+  expect(harness.frame()).toContain("$0.6500")
 
   // Inside the window: re-emitting a retained id is deduplicated.
   harness.emit("message.updated", { sessionID, info: assistantMessage({ id: "d-64", sessionID, created: 1, completed: 2, cost: 0.01 }) })
   await harness.renderOnce()
-  expect(harness.frame()).toContain("COST $0.6500")
+  expect(harness.frame()).toContain("$0.6500")
 
   // Outside the window: the oldest id (d-0) was evicted, so re-emitting it accumulates again.
   harness.emit("message.updated", { sessionID, info: assistantMessage({ id: "d-0", sessionID, created: 1, completed: 2, cost: 0.01 }) })
   await harness.renderOnce()
-  expect(harness.frame()).toContain("COST $0.6600")
+  expect(harness.frame()).toContain("$0.6600")
 })
 
 test("idle clears unfinished timings for the session", async () => {
@@ -541,5 +645,112 @@ test("tool-only turn still accumulates AVG and TTFT", async () => {
   })
 
   await harness.renderOnce()
-  expect(harness.frame()).toContain("AVG 20.0 | TTFT 0.5s")
+  const frame = harness.frame()
+  expect(frame).toContain("AVG 20.0")
+  expect(frame).toContain("TTFT 0.5s")
+})
+
+test("model panel lists the active model first with an active marker", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "a", sessionID: "one", created: 1, providerID: "provider", modelID: "a" }),
+  })
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "b", sessionID: "one", created: 2, providerID: "provider", modelID: "b" }),
+  })
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(internals().activeModel("one")).toBe("provider/b")
+  expect(frame).toContain("provider/b   active")
+  expect(frame.indexOf("provider/b")).toBeLessThan(frame.indexOf("provider/a"))
+})
+
+test("model panel caps at four models and reports the overflow", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  for (const modelID of ["a", "b", "c", "d", "e", "f"]) {
+    harness.emit("message.updated", {
+      sessionID: "one",
+      info: assistantMessage({ id: modelID, sessionID: "one", created: 1, providerID: "provider", modelID }),
+    })
+  }
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(frame).toContain("provider/f   active")
+  expect(frame).toContain("+2 more models")
+  expect(frame).not.toContain("provider/a")
+  expect(frame).not.toContain("provider/b")
+})
+
+test("model panel reports session retries without per-model attribution", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "a", sessionID: "one", created: 1, providerID: "provider", modelID: "a" }),
+  })
+  harness.emit("session.status", { sessionID: "one", status: { type: "retry", attempt: 1, message: "rate limited", next: 0 } })
+  harness.emit("session.status", { sessionID: "one", status: { type: "retry", attempt: 2, message: "rate limited", next: 0 } })
+
+  await harness.renderOnce()
+  expect(harness.frame()).toContain("Session CACHE — · retries 2")
+})
+
+test("toggling a row updates the fold state and requests a redraw", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  completeStep(harness, "one", 1_700_000_000_000, 20)
+  await harness.renderOnce()
+  const panel = harness.controller()
+  expect(panel.isExpanded("provider/model")).toBe(true)
+
+  const before = harness.renderRequests()
+  panel.toggle("provider/model")
+  expect(panel.isExpanded("provider/model")).toBe(false)
+  expect(harness.renderRequests()).toBeGreaterThan(before)
+
+  await harness.renderOnce()
+  const collapsed = harness.frame()
+  expect(collapsed).toContain("▶ provider/model")
+  expect(collapsed).not.toContain("TTFT 0.5s")
+
+  panel.toggle("provider/model")
+  expect(panel.isExpanded("provider/model")).toBe(true)
+  await harness.renderOnce()
+  const expanded = harness.frame()
+  expect(expanded).toContain("▼ provider/model")
+  expect(expanded).toContain("TTFT 0.5s")
+})
+
+test("toggling an inactive row expands only that row", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "a", sessionID: "one", created: 1, providerID: "provider", modelID: "a" }),
+  })
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "b", sessionID: "one", created: 2, providerID: "provider", modelID: "b" }),
+  })
+  await harness.renderOnce()
+
+  harness.controller().toggle("provider/a")
+  expect(harness.controller().isExpanded("provider/a")).toBe(true)
+  expect(harness.controller().isExpanded("provider/b")).toBe(true)
+
+  await harness.renderOnce()
+  const frame = harness.frame()
+  expect(frame).toContain("▼ provider/a")
+  expect((frame.match(/TTFT /g) ?? []).length).toBe(2)
 })

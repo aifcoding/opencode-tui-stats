@@ -2,6 +2,7 @@ import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
 
 export type StreamSample = {
   at: number
+  messageID: string
   tokens: number
 }
 
@@ -28,12 +29,37 @@ export type SessionStats = {
   lastAttempt: number
 }
 
+/** Per-model aggregate within a session, keyed by `providerID/modelID`.
+ * `cacheRead`/`cachePrompt`/`cost`/`steps` mirror {@link SessionStats}; the `total*`/`stepCount`
+ * fields mirror {@link SessionAverage} so the existing rate/TTFT helpers can be reused as-is. */
+export type ModelAggregate = {
+  cacheRead: number
+  cachePrompt: number
+  cost: number
+  steps: number
+  totalTokens: number
+  totalDurationMs: number
+  totalTtftMs: number
+  stepCount: number
+}
+
+export type SessionModels = {
+  /** Most recently observed assistant `providerID/modelID` for the session. */
+  active?: string
+  /** Model keys in observation order (oldest first, most recent last). */
+  order: string[]
+  aggregates: Record<string, ModelAggregate>
+  /** `messageID -> providerID/modelID`, used to attribute live samples to a model. */
+  messageModels: Map<string, string>
+}
+
 export type Tracker = {
   samples: Record<string, StreamSample[]>
   timings: Record<string, MessageTiming>
   averages: Record<string, SessionAverage>
   stats: Record<string, SessionStats>
   dedup: Record<string, Set<string>>
+  models: Record<string, SessionModels>
 }
 
 const STREAM_WINDOW_MS = 5_000
@@ -43,10 +69,31 @@ const PART_CACHE_LIMIT = 1_024
 /** Per-session dedup window: only the most recent completed messages are deduplicated;
  * a repeated completed event beyond this window accumulates again. */
 const DEDUP_WINDOW_LIMIT = 64
+/** Cap on `messageID -> model` entries retained per session (FIFO). */
+const MESSAGE_MODEL_LIMIT = 256
 const SESSION_LIMIT = 64
+/** Maximum number of model rows rendered in the sidebar panel. */
+export const MODEL_ROW_LIMIT = 4
 
 function emptyStats(): SessionStats {
   return { cacheRead: 0, cachePrompt: 0, cost: 0, steps: 0, retries: 0, lastAttempt: 0 }
+}
+
+function emptyAggregate(): ModelAggregate {
+  return {
+    cacheRead: 0,
+    cachePrompt: 0,
+    cost: 0,
+    steps: 0,
+    totalTokens: 0,
+    totalDurationMs: 0,
+    totalTtftMs: 0,
+    stepCount: 0,
+  }
+}
+
+export function modelKey(providerID: string, modelID: string) {
+  return `${providerID}/${modelID}`
 }
 
 export function estimateTokens(delta: string) {
@@ -90,13 +137,14 @@ export function averageTtft(average: SessionAverage | undefined) {
   return formatTtft(average.totalTtftMs / average.stepCount / 1_000)
 }
 
-export function cacheRate(stats: SessionStats | undefined) {
-  if (!stats || stats.cachePrompt <= 0) return "-"
+/** Cache hit percentage (e.g. `31%`) or `undefined` when nothing promptable has been seen. */
+export function cacheText(stats: { cacheRead: number; cachePrompt: number } | undefined) {
+  if (!stats || stats.cachePrompt <= 0) return undefined
   return `${Math.round((stats.cacheRead / stats.cachePrompt) * 100)}%`
 }
 
-export function costText(stats: SessionStats | undefined) {
-  if (!stats || stats.steps <= 0) return "-"
+export function costText(stats: { cost: number; steps: number } | undefined) {
+  if (!stats || stats.steps <= 0) return undefined
   return `$${stats.cost >= 1 ? stats.cost.toFixed(2) : stats.cost.toFixed(4)}`
 }
 
@@ -120,6 +168,25 @@ function boundedSet<K, V>(map: Map<K, V>, key: K, value: V, limit: number) {
   map.set(key, value)
 }
 
+export type ModelRow = {
+  key: string
+  label: string
+  active: boolean
+  tps?: string
+  avg?: string
+  ttft?: string
+  cache?: string
+  cost?: string
+}
+
+export type ModelPanel = {
+  rows: ModelRow[]
+  overflow: number
+  retries: number
+  /** Session-level cache hit percentage (e.g. `31%`), or `undefined` when nothing promptable was seen. */
+  cache?: string
+}
+
 export type TrackerInternals = {
   sizes(): {
     parts: number
@@ -134,10 +201,11 @@ export type TrackerInternals = {
   dedupSize(sessionID: string): number
   retries(sessionID: string): number
   mounted(): string[]
+  activeModel(sessionID: string): string | undefined
 }
 
 export type TrackerHandle = {
-  statusText(sessionID: string): string
+  modelRows(sessionID: string): ModelPanel
   mountSession(sessionID: string): void
   unmountSession(sessionID: string): void
   prune(now?: number): void
@@ -153,7 +221,7 @@ export function getLastInternals(): TrackerInternals | undefined {
 }
 
 export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerHandle {
-  const tracker: Tracker = { samples: {}, timings: {}, averages: {}, stats: {}, dedup: {} }
+  const tracker: Tracker = { samples: {}, timings: {}, averages: {}, stats: {}, dedup: {}, models: {} }
   const partDecisions = new Map<string, boolean>()
   const mounted = new Set<string>()
   const order: string[] = []
@@ -182,6 +250,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     delete tracker.averages[sessionID]
     delete tracker.samples[sessionID]
     delete tracker.dedup[sessionID]
+    delete tracker.models[sessionID]
     clearTimings(sessionID)
   }
 
@@ -201,6 +270,13 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
       order.splice(index, 1)
       evictSession(candidate)
     }
+  }
+
+  const touchModel = (models: SessionModels, key: string) => {
+    const at = models.order.indexOf(key)
+    if (at !== -1) models.order.splice(at, 1)
+    models.order.push(key)
+    if (!models.aggregates[key]) models.aggregates[key] = emptyAggregate()
   }
 
   const prune = (now = Date.now()) => {
@@ -228,12 +304,16 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     bump()
   }
 
-  const liveRate = (sessionID: string) => {
+  /** Live rate restricted to samples attributed to `key` via the `messageID -> model` mapping. */
+  const liveRateFor = (sessionID: string, key: string) => {
     const status = api.state.session.status(sessionID)
     if (!status || status.type === "idle") return undefined
 
     const now = Date.now()
-    const samples = (tracker.samples[sessionID] ?? []).filter((sample) => now - sample.at <= STREAM_WINDOW_MS)
+    const mapping = tracker.models[sessionID]?.messageModels
+    const samples = (tracker.samples[sessionID] ?? []).filter(
+      (sample) => now - sample.at <= STREAM_WINDOW_MS && mapping?.get(sample.messageID) === key,
+    )
     const last = samples[samples.length - 1]
     if (!last || now - last.at > LIVE_STALE_MS) return undefined
 
@@ -241,13 +321,38 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     return formatRate(tokens / (activeDuration(samples, now) / 1_000))
   }
 
-  const statusText = (sessionID: string) => {
-    const average = tracker.averages[sessionID]
-    const stats = tracker.stats[sessionID]
-    const live = liveRate(sessionID) ?? "-"
-    const avg = averageRate(average) ?? "-"
-    const ttft = averageTtft(average) ?? "-"
-    return `TPS ${live} | AVG ${avg} | TTFT ${ttft} | CACHE ${cacheRate(stats)} | COST ${costText(stats)} | RETRY ${stats?.retries ?? 0}`
+  const modelRows = (sessionID: string): ModelPanel => {
+    const models = tracker.models[sessionID]
+    const retries = tracker.stats[sessionID]?.retries ?? 0
+    const cache = cacheText(tracker.stats[sessionID])
+    if (!models) return { rows: [], overflow: 0, retries, cache }
+
+    const active = models.active
+    // `order` is oldest→newest; reverse for most-recent-first ordering of the non-active rows.
+    const recency = [...models.order].reverse().filter((key) => key in models.aggregates)
+    const ordered =
+      active && active in models.aggregates ? [active, ...recency.filter((key) => key !== active)] : recency
+
+    const visible = ordered.slice(0, MODEL_ROW_LIMIT)
+    const overflow = Math.max(0, ordered.length - visible.length)
+
+    const rows = visible.map<ModelRow>((key) => {
+      const aggregate = models.aggregates[key]
+      const isActive = key === active
+      const cost = costText(aggregate)
+      return {
+        key,
+        label: key,
+        active: isActive,
+        tps: isActive ? liveRateFor(sessionID, key) : undefined,
+        avg: averageRate(aggregate),
+        ttft: averageTtft(aggregate),
+        cache: cacheText(aggregate),
+        cost: cost === undefined ? undefined : cost,
+      }
+    })
+
+    return { rows, overflow, retries, cache }
   }
 
   listeners.push(
@@ -269,6 +374,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
 
       appendSample(sessionID, messageID, {
         at: Date.now(),
+        messageID,
         tokens: estimateTokens(event.properties.delta),
       })
     }),
@@ -279,6 +385,15 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
       const info = event.properties.info
       if (info.role !== "assistant") return
       const sessionID = event.properties.sessionID
+      const key = modelKey(info.providerID, info.modelID)
+
+      // Observe the model as soon as a message appears so the sidebar can attribute live samples
+      // and mark the most recently used model as active.
+      const models =
+        tracker.models[sessionID] ?? (tracker.models[sessionID] = { order: [], aggregates: {}, messageModels: new Map() })
+      touchModel(models, key)
+      models.active = key
+      boundedSet(models.messageModels, info.id, key, MESSAGE_MODEL_LIMIT)
 
       if (!info.time.completed) {
         const existing = tracker.timings[info.id]
@@ -308,6 +423,14 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
           cost: stats.cost + info.cost,
           steps: stats.steps + 1,
         }
+        const aggregate = models.aggregates[key] ?? emptyAggregate()
+        models.aggregates[key] = {
+          ...aggregate,
+          cacheRead: aggregate.cacheRead + cacheRead,
+          cachePrompt: aggregate.cachePrompt + info.tokens.input + cacheRead + cacheWrite,
+          cost: aggregate.cost + info.cost,
+          steps: aggregate.steps + 1,
+        }
       }
 
       const timing = tracker.timings[info.id]
@@ -327,6 +450,14 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
             totalDurationMs: totals.totalDurationMs + durationMs,
             totalTtftMs: totals.totalTtftMs + Math.max(timing.firstResponseAt - timing.requestStartAt, 0),
             stepCount: totals.stepCount + 1,
+          }
+          const aggregate = models.aggregates[key] ?? emptyAggregate()
+          models.aggregates[key] = {
+            ...aggregate,
+            totalTokens: aggregate.totalTokens + tokens,
+            totalDurationMs: aggregate.totalDurationMs + durationMs,
+            totalTtftMs: aggregate.totalTtftMs + Math.max(timing.firstResponseAt - timing.requestStartAt, 0),
+            stepCount: aggregate.stepCount + 1,
           }
         }
       }
@@ -396,6 +527,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     }),
   )
 
+  // The 1s tick re-evaluates live TPS staleness and prunes stale stream samples.
   const timer = setInterval(() => {
     prune()
     bump()
@@ -415,11 +547,12 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     dedupSize: (sessionID) => tracker.dedup[sessionID]?.size ?? 0,
     retries: (sessionID) => tracker.stats[sessionID]?.retries ?? 0,
     mounted: () => [...mounted],
+    activeModel: (sessionID) => tracker.models[sessionID]?.active,
   }
   lastInternals = internals
 
   return {
-    statusText,
+    modelRows,
     mountSession(sessionID) {
       mounted.add(sessionID)
     },
@@ -436,4 +569,27 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
       if (lastInternals === internals) lastInternals = undefined
     },
   }
+}
+
+/** Test-only fold controller. Kept in this non-entry module: the plugin entry (`tui.tsx`)
+ * may only expose a `default` export, because the legacy loader treats every runtime export
+ * as a plugin. */
+export type PanelController = {
+  toggle(key: string): void
+  isExpanded(key: string): boolean
+}
+
+let lastPanelController: PanelController | undefined
+
+export function setLastPanelController(controller: PanelController) {
+  lastPanelController = controller
+}
+
+/** Clear the controller only when it is still the current one. */
+export function clearLastPanelController(controller: PanelController) {
+  if (lastPanelController === controller) lastPanelController = undefined
+}
+
+export function getLastPanelController(): PanelController | undefined {
+  return lastPanelController
 }
