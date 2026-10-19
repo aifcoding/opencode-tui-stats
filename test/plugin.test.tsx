@@ -344,7 +344,7 @@ test("empty session renders the placeholder row", async () => {
   harness.setStatus("one", { type: "busy" })
   await harness.renderOnce()
   const frame = harness.frame()
-  expect(frame).toContain("Performance · observed")
+  expect(frame).toContain("Model-Performance · observed")
   expect(frame).toContain("Session CACHE —")
   expect(frame).not.toContain("retries")
 })

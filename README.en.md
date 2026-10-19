@@ -1,6 +1,6 @@
 # opencode-tui-stats
 
-A TUI plugin for OpenCode 1.x (v1), mounted at the bottom of the right sidebar (slot `sidebar_footer`), with the panel title `Performance · observed`. Each model occupies one row that can be collapsed/expanded by mouse click.
+A TUI plugin for OpenCode 1.x (v1), mounted at the bottom of the right sidebar (slot `sidebar_footer`), with the panel title `Model-Performance · observed`. Each model occupies one row that can be collapsed/expanded by mouse click.
 
 ## Demo
 

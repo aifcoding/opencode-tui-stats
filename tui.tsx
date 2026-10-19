@@ -168,7 +168,7 @@ function ModelPanelView(props: {
   return (
     <box flexDirection="column">
       <text fg={props.api.theme.current.text} wrapMode="none" truncate>
-        <b>Performance · observed</b>
+        <b>Model-Performance · observed</b>
       </text>
       <Show when={panel().rows.length === 0}>
         <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
