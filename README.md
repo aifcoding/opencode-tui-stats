@@ -1,6 +1,6 @@
 # opencode-tui-stats
 
-OpenCode 1.x（v1）的 TUI 插件，安装在右侧栏底部（slot `sidebar_footer`），面板标题为 `Model-Performance · observed`。每个模型占一行，鼠标点击可折叠/展开。
+OpenCode 1.x（v1）的 TUI 插件，安装在右侧栏内容区（slot `sidebar_content`），面板标题为 `Model-Performance · observed`。每个模型占一行，鼠标点击可折叠/展开。
 
 ## 演示
 

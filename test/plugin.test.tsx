@@ -171,7 +171,7 @@ async function createHarness(): Promise<Harness> {
     slots: {
       register(registered: { slots?: Record<string, unknown> }) {
         const slots = registered.slots ?? {}
-        if (typeof slots.sidebar_footer === "function") sidebarRender = slots.sidebar_footer as SidebarRender
+        if (typeof slots.sidebar_content === "function") sidebarRender = slots.sidebar_content as SidebarRender
         return "opencode-tui-stats"
       },
     },

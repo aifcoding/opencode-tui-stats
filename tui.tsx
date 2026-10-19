@@ -104,7 +104,7 @@ function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boole
   )
 }
 
-/** Per-session model panel, mounted at `sidebar_footer`. */
+/** Per-session model panel, mounted into the sidebar content (after the built-in sections). */
 function ModelPanelView(props: {
   api: TuiPluginApi
   sessionID: string
@@ -200,7 +200,7 @@ const tui: TuiPlugin = async (api) => {
 
   api.slots.register({
     slots: {
-      sidebar_footer(_context, props) {
+      sidebar_content(_context, props) {
         return <ModelPanelView api={api} sessionID={props.session_id} tracker={tracker} revision={revision} />
       },
     },
