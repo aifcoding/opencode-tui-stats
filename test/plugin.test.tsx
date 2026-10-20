@@ -409,6 +409,53 @@ test("streaming deltas produce a live TPS reading", async () => {
   expect(harness.frame()).toContain("TPS 10.0")
 })
 
+test("a streaming row starts with one of the spinner frames", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  harness.setStatus("one", { type: "busy" })
+  harness.setParts("message", [textPart("part", "message", "one")])
+  setSystemTime(base)
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "message", sessionID: "one", created: base, providerID: "provider", modelID: "a" }),
+  })
+  setSystemTime(base + 1_000)
+  harness.emit("message.part.delta", {
+    sessionID: "one",
+    messageID: "message",
+    partID: "part",
+    field: "text",
+    delta: "x".repeat(25),
+  })
+
+  await harness.renderOnce()
+  const row = harness
+    .frame()
+    .split("\n")
+    .find((line) => line.includes("provider/a"))
+  expect(row).toBeDefined()
+  // Any of the four frames is acceptable; the assertion must not pin a specific tick.
+  expect(row).toMatch(/[◐◓◑◒] ▼ provider\/a/)
+})
+
+test("an idle panel renders neither marker", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  completeMessage(harness, "one", 1_700_000_000_000, { output: 20 })
+  harness.setStatus("one", { type: "idle" })
+  harness.emit("session.status", { sessionID: "one", status: { type: "idle" } })
+  await harness.renderOnce()
+
+  const frame = harness.frame()
+  expect(frame).toContain("provider/model")
+  // The stream ended and the session is idle, so the row falls back to the blank alignment slot.
+  expect(frame).not.toContain("●")
+  expect(frame).not.toMatch(/[◐◓◑◒]/)
+})
+
 test("finished session keeps the last live TPS reading, dimmed", async () => {
   const harness = await createHarness()
   activeHarness = harness
@@ -563,9 +610,8 @@ test("expanded rows align metric columns and omit idle TPS", async () => {
   expect(frame).toContain("▼ deepseek-flash")
   expect(frame).not.toContain("deepseek/deepseek-flash")
   expect(frame).toContain("deepseek/other")
-  // Only the active model row carries the green dot.
-  expect(frame).toContain("● ▼ deepseek/other")
-  expect(frame).not.toContain("● ▼ deepseek-flash")
+  // The spinner marks streaming rows, not the active one: nothing streamed here.
+  expect(frame).not.toMatch(/[◐◓◑◒]/)
   // Neither model was ever observed streaming, so no TPS history exists.
   expect(frame).not.toContain("TPS")
 
@@ -856,7 +902,7 @@ test("tool-only turn still accumulates AVG and TTFT", async () => {
   expect(frame).toContain("TTFT 0.5s")
 })
 
-test("model panel lists the active model first", async () => {
+test("model panel keeps rows in first-seen order regardless of the active model", async () => {
   const harness = await createHarness()
   activeHarness = harness
 
@@ -871,10 +917,121 @@ test("model panel lists the active model first", async () => {
 
   await harness.renderOnce()
   const frame = harness.frame()
+  // `b` is the most recent model, but ordering follows first appearance: `a` then `b`.
   expect(internals().activeModel("one")).toBe("provider/b")
   expect(frame).toContain("▼ provider/b")
   expect(frame).not.toContain("active")
-  expect(frame.indexOf("provider/b")).toBeLessThan(frame.indexOf("provider/a"))
+  expect(frame.indexOf("provider/a")).toBeLessThan(frame.indexOf("provider/b"))
+})
+
+test("changing the active model does not reorder rows", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  for (const [id, modelID, created] of [
+    ["a", "a", 1],
+    ["b", "b", 2],
+  ] as const) {
+    harness.emit("message.updated", {
+      sessionID: "one",
+      info: assistantMessage({ id, sessionID: "one", created, providerID: "provider", modelID }),
+    })
+  }
+  await harness.renderOnce()
+  expect(internals().activeModel("one")).toBe("provider/b")
+
+  // Use the older model again: it becomes active, but its row must stay in the first slot.
+  setSystemTime(base)
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "a-2", sessionID: "one", created: 4, providerID: "provider", modelID: "a" }),
+  })
+  await harness.renderOnce()
+
+  // The default expanded row moved to the newly active model; the row order did not.
+  const panel = harness.frame()
+  expect(internals().activeModel("one")).toBe("provider/a")
+  expect(panel).toContain("▼ provider/a")
+  expect(panel).toContain("▶ provider/b")
+  expect(panel.indexOf("provider/a")).toBeLessThan(panel.indexOf("provider/b"))
+})
+
+test("the row marker moves through busy, streaming, and idle", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  const sessionID = "one"
+  const messageID = "m"
+  const partID = "m-part"
+  harness.setStatus(sessionID, { type: "busy" })
+  harness.setParts(messageID, [textPart(partID, messageID, sessionID)])
+  setSystemTime(base)
+  harness.emit("message.updated", {
+    sessionID,
+    info: assistantMessage({ id: messageID, sessionID, created: base, providerID: "provider", modelID: "a" }),
+  })
+
+  // Busy, no tokens yet: a solid dot at the start of the row.
+  await harness.renderOnce()
+  const busy = harness
+    .frame()
+    .split("\n")
+    .find((line) => line.includes("provider/a"))
+  expect(busy).toMatch(/^● ▼ provider\/a/)
+  expect(busy).not.toMatch(/[◐◓◑◒]/)
+
+  // First tokens: the dot is replaced by one of the spinner frames.
+  setSystemTime(base + 1_000)
+  harness.emit("message.part.delta", { sessionID, messageID, partID, field: "text", delta: "x".repeat(25) })
+  await harness.renderOnce()
+  const streaming = harness
+    .frame()
+    .split("\n")
+    .find((line) => line.includes("provider/a"))
+  expect(streaming).toMatch(/^[◐◓◑◒] ▼ provider\/a/)
+  expect(streaming).not.toContain("●")
+
+  // Idle: neither marker is left, only the blank alignment slot.
+  setSystemTime(base + 2_000)
+  harness.setStatus(sessionID, { type: "idle" })
+  harness.emit("session.idle", { sessionID })
+  await harness.renderOnce()
+  const idle = harness
+    .frame()
+    .split("\n")
+    .find((line) => line.includes("provider/a"))
+  expect(idle).toContain("▼ provider/a")
+  expect(idle).not.toContain("●")
+  expect(idle).not.toMatch(/[◐◓◑◒]/)
+})
+
+test("a busy subagent marks only its own model row", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  harness.setSession("child", "one")
+  harness.emit("session.created", { sessionID: "child", info: sessionInfo("child", "one") })
+
+  completeMessage(harness, "one", base, { modelID: "a", output: 20 })
+  harness.setStatus("one", { type: "idle" })
+
+  // The child is busy on `b` without any tokens; the parent is idle.
+  harness.setStatus("child", { type: "busy" })
+  harness.emit("message.updated", {
+    sessionID: "child",
+    info: assistantMessage({ id: "child-m", sessionID: "child", created: base + 200_000, providerID: "provider", modelID: "b" }),
+  })
+
+  await harness.renderOnce()
+  const lines = harness.frame().split("\n")
+  const rowA = lines.find((line) => line.includes("provider/a"))
+  const rowB = lines.find((line) => line.includes("↳ provider/b"))
+  expect(rowB).toMatch(/^● ▶ ↳ provider\/b/)
+  expect(rowA).not.toContain("●")
+  expect(rowA).not.toMatch(/[◐◓◑◒]/)
 })
 
 test("model panel caps at four models and reports the overflow", async () => {
@@ -890,10 +1047,12 @@ test("model panel caps at four models and reports the overflow", async () => {
 
   await harness.renderOnce()
   const frame = harness.frame()
-  expect(frame).toContain("▼ provider/f")
+  // Fixed order keeps the four oldest models; the newest two are only counted in the overflow.
+  expect(frame).toContain("▶ provider/a")
+  expect(frame).toContain("▶ provider/d")
   expect(frame).toContain("+2 more models")
-  expect(frame).not.toContain("provider/a")
-  expect(frame).not.toContain("provider/b")
+  expect(frame).not.toContain("provider/e")
+  expect(frame).not.toContain("provider/f")
 })
 
 test("model panel reports session retries without per-model attribution", async () => {
@@ -1002,6 +1161,95 @@ test("parent and subagent sharing one model collapse into a single summed row", 
   // steps=2, tokens=50 over 2 x 2000ms → 12.5 tok/s; TTFT stays 0.5s per step.
   expect(frame).toContain("AVG 12.5")
   expect(frame).toContain("TTFT 0.5s")
+})
+
+test("parallel streams of different models light up both rows with their own TPS", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  harness.setStatus("one", { type: "busy" })
+  for (const [messageID, modelID] of [
+    ["m-a", "a"],
+    ["m-b", "b"],
+  ] as const) {
+    harness.setParts(messageID, [textPart(`${messageID}-part`, messageID, "one")])
+    setSystemTime(base)
+    harness.emit("message.updated", {
+      sessionID: "one",
+      info: assistantMessage({ id: messageID, sessionID: "one", created: base, providerID: "provider", modelID }),
+    })
+  }
+
+  // Both messages stream at the same wall clock: `a` sends 5 tokens per tick, `b` sends 10.
+  for (const [messageID, size] of [
+    ["m-a", 25],
+    ["m-b", 50],
+  ] as const) {
+    for (const at of [base, base + 1_000]) {
+      setSystemTime(at)
+      harness.emit("message.part.delta", {
+        sessionID: "one",
+        messageID,
+        partID: `${messageID}-part`,
+        field: "text",
+        delta: "x".repeat(size),
+      })
+    }
+  }
+
+  // The newer model (b) starts expanded; open `a` too so both TPS readings are rendered.
+  harness.controller().toggle("provider/a")
+  await harness.renderOnce()
+  const frame = harness.frame()
+  // Two streams, two spinners: the marker no longer means "the active model". Any frame is valid.
+  expect(frame).toMatch(/[◐◓◑◒] ▼ provider\/a/)
+  expect(frame).toMatch(/[◐◓◑◒] ▼ provider\/b/)
+  expect(frame).toContain("TPS 10.0t/s")
+  expect(frame).toContain("TPS 20.0t/s")
+})
+
+test("parent and subagent streaming one model report the summed TPS", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  harness.setSession("child", "one")
+  harness.emit("session.created", { sessionID: "child", info: sessionInfo("child", "one") })
+
+  const stream = (sessionID: string, messageID: string, size: number) => {
+    harness.setStatus(sessionID, { type: "busy" })
+    harness.setParts(messageID, [textPart(`${messageID}-part`, messageID, sessionID)])
+    setSystemTime(base)
+    harness.emit("message.updated", {
+      sessionID,
+      info: assistantMessage({ id: messageID, sessionID, created: base }),
+    })
+    for (const at of [base, base + 1_000]) {
+      setSystemTime(at)
+      harness.emit("message.part.delta", {
+        sessionID,
+        messageID,
+        partID: `${messageID}-part`,
+        field: "text",
+        delta: "x".repeat(size),
+      })
+    }
+  }
+
+  // Parent streams 10 tok/s while the subagent streams 20 tok/s in the same window.
+  stream("one", "m-parent", 25)
+  stream("child", "m-child", 50)
+
+  setSystemTime(base + 1_000)
+  await harness.renderOnce()
+  const frame = harness.frame()
+  // The subagent contributes this model too, so the row keeps its `↳` merge marker and lights up.
+  expect(frame).toMatch(/[◐◓◑◒] ▼ ↳ provider\/model/)
+  // Both sessions feed the same row, so the row reports 10 + 20 rather than the newer one.
+  expect(frame).toContain("TPS 30.0t/s")
+  expect(frame).not.toContain("TPS 10.0t/s")
+  expect(frame).not.toContain("TPS 20.0t/s")
 })
 
 test("grandchild sessions are folded into the root panel", async () => {

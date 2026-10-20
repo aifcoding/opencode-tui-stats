@@ -15,6 +15,9 @@ const DETAIL_INDENT = "   "
 const RATE_CELL = 4
 const TTFT_CELL = 6
 const CACHE_CELL = 6
+/** Quarter-circle frames keep the live marker distinct from the braille spinners other tools use. */
+const SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+const SPINNER_MS = 100
 
 /** Split `provider/model` so the provider can be de-emphasised. Model ids may contain slashes, so
  * only the first slash separates the provider. When the model already starts with the provider name
@@ -43,7 +46,13 @@ function cacheCell(value: string | undefined) {
 }
 
 /** A single model row: fold marker + summary line, plus its detail lines when expanded. */
-function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boolean; onToggle: () => void }) {
+function ModelRowView(props: {
+  api: TuiPluginApi
+  row: ModelRow
+  expanded: boolean
+  frame: number
+  onToggle: () => void
+}) {
   // Guard against a drag-select being read as a click: only toggle when the press and the
   // release land on the same cell.
   let pressed: { x: number; y: number } | undefined
@@ -61,13 +70,19 @@ function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boole
 
   const theme = () => props.api.theme.current
   const parts = () => splitLabel(props.row.label)
+  // Three-state marker: streaming spins, a busy model that has not produced tokens yet shows a
+  // solid dot, and every other row keeps a blank slot so names stay aligned.
+  const marker = () => {
+    if (props.row.streaming) return `${SPINNER_FRAMES[props.frame]} `
+    return props.row.busy ? "● " : "  "
+  }
 
   return (
     <box flexDirection="column" onMouseDown={handleMouseDown} onMouseUp={handleMouseUp}>
       <text wrapMode="none" truncate>
-        {/* The most recently used model gets a green dot; other rows keep a blank slot so
-         * names stay aligned without spending extra width on a second marker. */}
-        <span style={{ fg: theme().success } as Record<string, unknown>}>{props.row.active ? "● " : "  "}</span>
+        {/* The animated marker flags a model that is streaming right now, so parallel sessions can
+         * light up several rows at once; a busy row that has not tokenised yet gets a solid dot. */}
+        <span style={{ fg: theme().success } as Record<string, unknown>}>{marker()}</span>
         <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{`${props.expanded ? "▼" : "▶"} `}</span>
         <Show when={props.row.subagent}>
           <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{"↳ "}</span>
@@ -78,6 +93,11 @@ function ModelRowView(props: { api: TuiPluginApi; row: ModelRow; expanded: boole
           <span style={{ fg: theme().text, dim: true } as Record<string, unknown>}>{parts().provider}</span>
         </Show>
         <span style={{ fg: theme().text } as Record<string, unknown>}>{parts().model}</span>
+        {/* Only a live stream gets an inline rate, so collapsed rows still expose parallel activity
+         * without expanding; the frozen value stays in the expanded detail lines. */}
+        <Show when={props.row.streaming && props.row.tps !== undefined}>
+          <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{`  ${rateCell(props.row.tps)}`}</span>
+        </Show>
       </text>
       <Show when={props.expanded}>
         <text fg={theme().textMuted} wrapMode="none" truncate>
@@ -128,6 +148,29 @@ function ModelPanelView(props: {
     return props.tracker.modelRows(sessionID)
   })
 
+  const [now, setNow] = createSignal(Date.now())
+  const frame = () => Math.floor(now() / SPINNER_MS) % SPINNER_FRAMES.length
+
+  // Only a live stream needs the 10fps animation: an idle panel keeps no timer at all, and the
+  // revision signal stays out of the frame so TPS recalculation keeps its own cadence.
+  // The interval is created once and toggled: streaming bumps the revision on nearly every delta,
+  // so recreating it per effect run would clear each timer before its first 100ms tick.
+  let animationTimer: ReturnType<typeof setInterval> | undefined
+  createEffect(() => {
+    const streaming = panel().rows.some((row) => row.streaming)
+    if (streaming && animationTimer === undefined) {
+      // Signal updates only touch the virtual tree; the host paints on demand, so the animation
+      // tick has to request a render or the glyph would stay on its first frame.
+      animationTimer = setInterval(() => {
+        setNow(Date.now())
+        props.api.renderer?.requestRender?.()
+      }, SPINNER_MS)
+    } else if (!streaming && animationTimer !== undefined) {
+      clearInterval(animationTimer)
+      animationTimer = undefined
+    }
+  })
+
   // Fold state is in-memory only and resets per session. The active model starts expanded and
   // every other row starts collapsed; when the active model changes we return to that default
   // so the panel cannot accumulate open rows as models are switched.
@@ -161,6 +204,7 @@ function ModelPanelView(props: {
   setLastPanelController(controller)
 
   onCleanup(() => {
+    if (animationTimer !== undefined) clearInterval(animationTimer)
     if (mounted !== undefined) props.tracker.unmountSession(mounted)
     clearLastPanelController(controller)
   })
@@ -177,7 +221,13 @@ function ModelPanelView(props: {
       </Show>
       <For each={panel().rows}>
         {(row) => (
-          <ModelRowView api={props.api} row={row} expanded={expanded().has(row.key)} onToggle={() => toggle(row.key)} />
+          <ModelRowView
+            api={props.api}
+            row={row}
+            expanded={expanded().has(row.key)}
+            frame={frame()}
+            onToggle={() => toggle(row.key)}
+          />
         )}
       </For>
       <Show when={panel().overflow > 0}>

@@ -48,7 +48,8 @@ export type ModelAggregate = {
 export type SessionModels = {
   /** Most recently observed assistant `providerID/modelID` for the session. */
   active?: string
-  /** Model keys in observation order (oldest first, most recent last). */
+  /** Model keys in first-appearance order (oldest first). Re-observing a model never moves it,
+   * so the panel row order stays fixed for the life of the session. */
   order: string[]
   aggregates: Record<string, ModelAggregate>
   /** `messageID -> providerID/modelID`, used to attribute live samples to a model. */
@@ -182,7 +183,13 @@ function boundedSet<K, V>(map: Map<K, V>, key: K, value: V, limit: number) {
 export type ModelRow = {
   key: string
   label: string
+  /** Most recently used model in the subtree; drives the default expanded row only, never ordering. */
   active: boolean
+  /** True while this model is streaming in any session of the subtree; drives the spinner. */
+  streaming: boolean
+  /** True while a session of the subtree that uses this model is not idle, even before it emits
+   * its first token; drives the solid dot. Sessions that never used the model do not mark it. */
+  busy: boolean
   /** True when any descendant (subagent) session contributed data to this row. */
   subagent?: boolean
   /** Last measured live rate, or `undefined` when this model has never streamed. */
@@ -298,9 +305,8 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
   }
 
   const touchModel = (models: SessionModels, key: string) => {
-    const at = models.order.indexOf(key)
-    if (at !== -1) models.order.splice(at, 1)
-    models.order.push(key)
+    // First sighting decides the slot; later messages for the same model must not move the row.
+    if (models.order.indexOf(key) === -1) models.order.push(key)
     if (!models.aggregates[key]) models.aggregates[key] = emptyAggregate()
   }
 
@@ -329,13 +335,12 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     bump()
   }
 
-  /** Live rate restricted to samples attributed to `key` via the `messageID -> model` mapping.
-   * When the session is idle or the samples are stale, the last measured value is frozen and
-   * returned with `live: false` instead of disappearing. */
-  const sessionLiveRate = (sessionID: string, key: string): { value?: string; live: boolean } => {
-    const frozen = { value: tracker.models[sessionID]?.lastRate[key], live: false }
+  /** Numeric live rate of one session restricted to samples attributed to `key` via the
+   * `messageID -> model` mapping. Returns a number (never a formatted string) so callers can sum
+   * concurrent streams. `live: false` means this session is idle or its samples are stale. */
+  const sessionLiveRateValue = (sessionID: string, key: string): { rate?: number; live: boolean } => {
     const status = api.state.session.status(sessionID)
-    if (!status || status.type === "idle") return frozen
+    if (!status || status.type === "idle") return { live: false }
 
     const now = Date.now()
     const mapping = tracker.models[sessionID]?.messageModels
@@ -343,14 +348,12 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
       (sample) => now - sample.at <= STREAM_WINDOW_MS && mapping?.get(sample.messageID) === key,
     )
     const last = samples[samples.length - 1]
-    if (!last || now - last.at > LIVE_STALE_MS) return frozen
+    if (!last || now - last.at > LIVE_STALE_MS) return { live: false }
 
     const tokens = samples.reduce((sum, sample) => sum + sample.tokens, 0)
-    const value = formatRate(tokens / (activeDuration(samples, now) / 1_000))
-    if (value === undefined) return frozen
-    const models = tracker.models[sessionID]
-    if (models) models.lastRate[key] = value
-    return { value, live: true }
+    const rate = tokens / (activeDuration(samples, now) / 1_000)
+    if (!Number.isFinite(rate) || rate <= 0) return { live: false }
+    return { rate, live: true }
   }
 
   /** Fold a session's parent from `session.created`/`session.updated`, or lazily from state.
@@ -424,18 +427,62 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     return at
   }
 
-  /** Live rate for a merged row: the parent and its subagents share one row, so only the
-   * session/model pair that most recently saw activity contributes. Concurrent streams in a
-   * parent and a child are therefore approximated by the newer one instead of being summed. */
+  /** True while the session is working (anything but `idle`) even if no tokens have arrived yet.
+   * Used per row so a model that just started processing shows the solid dot instead of the
+   * spinner. */
+  const sessionBusy = (sessionID: string) => {
+    const status = api.state.session.status(sessionID)
+    return status !== undefined && status.type !== "idle"
+  }
+
+  /** Live rate for a merged row. A model can stream in several sessions of the same subtree at
+   * once (parent + subagents, or parallel subagents), and each of those streams produces its own
+   * tokens, so the row reports their sum: the rates are added, then formatted once. When nothing
+   * is streaming the last combined reading is frozen and propagated to every session that uses
+   * the model, so a single-session lookup still resolves to the combined value. */
   const liveRateFor = (sessions: string[], key: string): { value?: string; live: boolean } => {
-    let latest: { sessionID: string; at: number } | undefined
-    for (const sessionID of sessions) {
-      const aggregate = tracker.models[sessionID]?.aggregates[key]
-      if (!aggregate) continue
-      if (!latest || aggregate.lastAt >= latest.at) latest = { sessionID, at: aggregate.lastAt }
+    const contributing = sessions.filter((sessionID) => tracker.models[sessionID]?.aggregates[key])
+    if (contributing.length === 0) return { live: false }
+
+    let total = 0
+    let live = false
+    for (const sessionID of contributing) {
+      const measured = sessionLiveRateValue(sessionID, key)
+      if (!measured.live) continue
+      live = true
+      total += measured.rate ?? 0
     }
-    if (!latest) return { live: false }
-    return sessionLiveRate(latest.sessionID, key)
+
+    if (live) {
+      const value = formatRate(total)
+      if (value !== undefined) {
+        for (const sessionID of contributing) {
+          const models = tracker.models[sessionID]
+          if (models) models.lastRate[key] = value
+        }
+        return { value, live: true }
+      }
+    }
+
+    // Nothing is streaming: fall back to the most recent combined reading and store it on every
+    // session that uses this model, so any single hit returns the same total.
+    let frozen: string | undefined
+    let frozenAt = -1
+    for (const sessionID of contributing) {
+      const models = tracker.models[sessionID]
+      const value = models?.lastRate[key]
+      if (!models || value === undefined) continue
+      const at = models.aggregates[key]?.lastAt ?? 0
+      if (at <= frozenAt) continue
+      frozenAt = at
+      frozen = value
+    }
+    if (frozen === undefined) return { live: false }
+    for (const sessionID of contributing) {
+      const models = tracker.models[sessionID]
+      if (models) models.lastRate[key] = frozen
+    }
+    return { value: frozen, live: false }
   }
 
   const modelRows = (sessionID: string): ModelPanel => {
@@ -485,21 +532,24 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     let active: string | undefined
     for (const id of sessions) active = tracker.models[id].active ?? active
 
-    // `order` is oldest→newest; reverse for most-recent-first ordering of the non-active rows.
-    const recency = [...order].reverse()
-    const ordered = active && active in aggregates ? [active, ...recency.filter((key) => key !== active)] : recency
-
-    const visible = ordered.slice(0, MODEL_ROW_LIMIT)
-    const overflow = Math.max(0, ordered.length - visible.length)
+    // Fixed row order: `order` is first-appearance order (oldest session first, and within a
+    // session the oldest model first). Neither activity nor the active model reshuffles it, so a
+    // row keeps its slot for the whole session.
+    const visible = order.slice(0, MODEL_ROW_LIMIT)
+    const overflow = Math.max(0, order.length - visible.length)
 
     const rows = visible.map<ModelRow>((key) => {
       const aggregate = aggregates[key]
-      const isActive = key === active
-      const tps = isActive ? liveRateFor(subtree, key) : { value: undefined, live: false }
+      const tps = liveRateFor(subtree, key)
+      // A row is busy while any session of the subtree that has used this model is still
+      // working; a parallel subagent therefore lights up its own model without marking the rest.
+      const users = subtree.filter((id) => tracker.models[id]?.aggregates[key])
       return {
         key,
         label: key,
-        active: isActive,
+        active: key === active,
+        streaming: tps.live,
+        busy: users.some(sessionBusy),
         subagent: subagentModels.has(key),
         tps: tps.value,
         tpsLive: tps.live,
@@ -673,10 +723,12 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
         return
       }
 
-      // Any non-retry status resets the attempt baseline for the next retry burst.
-      if (stats.lastAttempt === 0) return
-      touchSession(sessionID)
-      tracker.stats[sessionID] = { ...stats, lastAttempt: 0 }
+      // Any non-retry status resets the attempt baseline for the next retry burst. The status also
+      // drives the row's busy marker, so notify on every transition — including idle → busy.
+      if (stats.lastAttempt !== 0) {
+        touchSession(sessionID)
+        tracker.stats[sessionID] = { ...stats, lastAttempt: 0 }
+      }
       bump()
     }),
   )
