@@ -228,7 +228,7 @@ export type TrackerInternals = {
 }
 
 export type TrackerHandle = {
-  modelRows(sessionID: string): ModelPanel
+  modelRows(sessionID: string, limit?: number): ModelPanel
   mountSession(sessionID: string): void
   unmountSession(sessionID: string): void
   prune(now?: number): void
@@ -492,7 +492,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     return { value: frozen, live: false }
   }
 
-  const modelRows = (sessionID: string): ModelPanel => {
+  const modelRows = (sessionID: string, limit = MODEL_ROW_LIMIT): ModelPanel => {
     // Link sessions that only announced themselves through message events (a child can stream
     // before its `session.created` event is delivered).
     for (const id of knownSessions()) resolveParent(id)
@@ -546,8 +546,9 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
       const rightSeq = modelFirstSeen.get(right) ?? Number.MAX_SAFE_INTEGER
       return leftSeq - rightSeq
     })
-    const visible = order.slice(0, MODEL_ROW_LIMIT)
-    const overflow = Math.max(0, order.length - visible.length)
+    // `limit` may be Infinity when the panel shows every model; `slice` handles that natively.
+    const visible = order.slice(0, limit)
+    const overflow = order.length - visible.length
 
     const rows = visible.map<ModelRow>((key) => {
       const aggregate = aggregates[key]
@@ -813,6 +814,14 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
 export type PanelController = {
   toggle(key: string): void
   isExpanded(key: string): boolean
+  /** Expand every model row past `MODEL_ROW_LIMIT` / collapse back to the capped list. */
+  toggleOverflow(): void
+  /** True while the panel lists every model instead of the first `MODEL_ROW_LIMIT` rows. */
+  overflowExpanded(): boolean
+  /** Collapse the whole module down to its title / restore the full panel. */
+  toggleModule(): void
+  /** True while only the panel title is rendered. */
+  moduleCollapsed(): boolean
 }
 
 let lastPanelController: PanelController | undefined

@@ -2,6 +2,7 @@
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, type Accessor } from "solid-js"
 import {
+  MODEL_ROW_LIMIT,
   clearLastPanelController,
   createTracker,
   setLastPanelController,
@@ -45,6 +46,25 @@ function cacheCell(value: string | undefined) {
   return `${percent.padStart(5)}%`
 }
 
+/** Guard against a drag-select being read as a click: only activate when the press and the
+ * release land on the same cell. Shared by model rows and the overflow rows. */
+function createPressGuard(onActivate: () => void) {
+  let pressed: { x: number; y: number } | undefined
+
+  const onMouseDown = (event: { x: number; y: number }) => {
+    pressed = { x: event.x, y: event.y }
+  }
+
+  const onMouseUp = (event: { x: number; y: number }) => {
+    const start = pressed
+    pressed = undefined
+    if (start && (start.x !== event.x || start.y !== event.y)) return
+    onActivate()
+  }
+
+  return { onMouseDown, onMouseUp }
+}
+
 /** A single model row: fold marker + summary line, plus its detail lines when expanded. */
 function ModelRowView(props: {
   api: TuiPluginApi
@@ -53,20 +73,7 @@ function ModelRowView(props: {
   frame: number
   onToggle: () => void
 }) {
-  // Guard against a drag-select being read as a click: only toggle when the press and the
-  // release land on the same cell.
-  let pressed: { x: number; y: number } | undefined
-
-  const handleMouseDown = (event: { x: number; y: number }) => {
-    pressed = { x: event.x, y: event.y }
-  }
-
-  const handleMouseUp = (event: { x: number; y: number }) => {
-    const start = pressed
-    pressed = undefined
-    if (start && (start.x !== event.x || start.y !== event.y)) return
-    props.onToggle()
-  }
+  const press = createPressGuard(() => props.onToggle())
 
   const theme = () => props.api.theme.current
   const parts = () => splitLabel(props.row.label)
@@ -78,7 +85,7 @@ function ModelRowView(props: {
   }
 
   return (
-    <box flexDirection="column" onMouseDown={handleMouseDown} onMouseUp={handleMouseUp}>
+    <box flexDirection="column" onMouseDown={press.onMouseDown} onMouseUp={press.onMouseUp}>
       <text wrapMode="none" truncate>
         {/* The animated marker flags a model that is streaming right now, so parallel sessions can
          * light up several rows at once; a busy row that has not tokenised yet gets a solid dot. */}
@@ -124,6 +131,20 @@ function ModelRowView(props: {
   )
 }
 
+/** Overflow row: either counts the hidden models or offers to fold the list back. It shares the
+ * row click handling so a click (not a drag) expands or collapses the full list. */
+function OverflowRow(props: { api: TuiPluginApi; label: string; onActivate: () => void }) {
+  const press = createPressGuard(() => props.onActivate())
+
+  return (
+    <box flexDirection="column" onMouseDown={press.onMouseDown} onMouseUp={press.onMouseUp}>
+      <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+        {props.label}
+      </text>
+    </box>
+  )
+}
+
 /** Per-session model panel, mounted into the sidebar content (after the built-in sections). */
 function ModelPanelView(props: {
   api: TuiPluginApi
@@ -134,6 +155,10 @@ function ModelPanelView(props: {
   let mounted: string | undefined
   const initialActive = props.tracker.internals.activeModel(props.sessionID)
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set(initialActive ? [initialActive] : []))
+  // The panel folds to MODEL_ROW_LIMIT rows by default; the overflow row expands it to every model.
+  const [showAll, setShowAll] = createSignal(false)
+  // The whole module can fold down to its title; the title row stays clickable in both states.
+  const [collapsed, setCollapsed] = createSignal(false)
   let seededActive: string | undefined = initialActive
   let lastSession: string | undefined = props.sessionID
 
@@ -145,7 +170,7 @@ function ModelPanelView(props: {
       props.tracker.mountSession(sessionID)
       mounted = sessionID
     }
-    return props.tracker.modelRows(sessionID)
+    return props.tracker.modelRows(sessionID, showAll() ? Number.POSITIVE_INFINITY : MODEL_ROW_LIMIT)
   })
 
   const [now, setNow] = createSignal(Date.now())
@@ -200,7 +225,27 @@ function ModelPanelView(props: {
     props.api.renderer?.requestRender?.()
   }
 
-  const controller = { toggle, isExpanded: (key: string) => expanded().has(key) }
+  const toggleOverflow = () => {
+    setShowAll((prev) => !prev)
+    props.api.renderer?.requestRender?.()
+  }
+
+  const toggleCollapsed = () => {
+    setCollapsed((prev) => !prev)
+    props.api.renderer?.requestRender?.()
+  }
+
+  // Reuse the row click guard so a drag-select over the title does not fold the module.
+  const titlePress = createPressGuard(() => toggleCollapsed())
+
+  const controller = {
+    toggle,
+    isExpanded: (key: string) => expanded().has(key),
+    toggleOverflow: () => toggleOverflow(),
+    overflowExpanded: () => showAll(),
+    toggleModule: () => toggleCollapsed(),
+    moduleCollapsed: () => collapsed(),
+  }
   setLastPanelController(controller)
 
   onCleanup(() => {
@@ -211,33 +256,42 @@ function ModelPanelView(props: {
 
   return (
     <box flexDirection="column">
-      <text fg={props.api.theme.current.text} wrapMode="none" truncate>
-        <b>Model-Performance · observed</b>
-      </text>
-      <Show when={panel().rows.length === 0}>
+      <box flexDirection="column" onMouseDown={titlePress.onMouseDown} onMouseUp={titlePress.onMouseUp}>
+        <text wrapMode="none" truncate>
+          {/* Fold marker stays muted so the bright bold title keeps the emphasis it had before. */}
+          <span style={{ fg: props.api.theme.current.textMuted } as Record<string, unknown>}>
+            {collapsed() ? "▶ " : "▼ "}
+          </span>
+          <b>Model-Performance · observed</b>
+        </text>
+      </box>
+      <Show when={!collapsed()}>
+        <Show when={panel().rows.length === 0}>
+          <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+            —
+          </text>
+        </Show>
+        <For each={panel().rows}>
+          {(row) => (
+            <ModelRowView
+              api={props.api}
+              row={row}
+              expanded={expanded().has(row.key)}
+              frame={frame()}
+              onToggle={() => toggle(row.key)}
+            />
+          )}
+        </For>
+        <Show when={!showAll() && panel().overflow > 0}>
+          <OverflowRow api={props.api} label={`+${panel().overflow} more models`} onActivate={toggleOverflow} />
+        </Show>
+        <Show when={showAll() && panel().rows.length > MODEL_ROW_LIMIT}>
+          <OverflowRow api={props.api} label="− show fewer models" onActivate={toggleOverflow} />
+        </Show>
         <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-          —
+          {`Session CACHE ${panel().cache ?? "—"}${panel().retries > 0 ? ` · retries ${panel().retries}` : ""}`}
         </text>
       </Show>
-      <For each={panel().rows}>
-        {(row) => (
-          <ModelRowView
-            api={props.api}
-            row={row}
-            expanded={expanded().has(row.key)}
-            frame={frame()}
-            onToggle={() => toggle(row.key)}
-          />
-        )}
-      </For>
-      <Show when={panel().overflow > 0}>
-        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-          {`+${panel().overflow} more models`}
-        </text>
-      </Show>
-      <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
-        {`Session CACHE ${panel().cache ?? "—"}${panel().retries > 0 ? ` · retries ${panel().retries}` : ""}`}
-      </text>
     </box>
   )
 }

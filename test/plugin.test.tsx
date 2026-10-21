@@ -1093,6 +1093,73 @@ test("model panel caps at four models and reports the overflow", async () => {
   expect(frame).not.toContain("provider/f")
 })
 
+test("overflow row expands every model and folds back", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  for (const modelID of ["a", "b", "c", "d", "e", "f"]) {
+    harness.emit("message.updated", {
+      sessionID: "one",
+      info: assistantMessage({ id: modelID, sessionID: "one", created: 1, providerID: "provider", modelID }),
+    })
+  }
+
+  await harness.renderOnce()
+  expect(harness.frame()).toContain("+2 more models")
+  expect(harness.controller().overflowExpanded()).toBe(false)
+
+  const before = harness.renderRequests()
+  harness.controller().toggleOverflow()
+  expect(harness.controller().overflowExpanded()).toBe(true)
+  expect(harness.renderRequests()).toBeGreaterThan(before)
+
+  await harness.renderOnce()
+  const expanded = harness.frame()
+  for (const modelID of ["a", "b", "c", "d", "e", "f"]) expect(expanded).toContain(`provider/${modelID}`)
+  expect(expanded).toContain("− show fewer models")
+  expect(expanded).not.toContain("+2 more models")
+
+  harness.controller().toggleOverflow()
+  expect(harness.controller().overflowExpanded()).toBe(false)
+  await harness.renderOnce()
+  const collapsed = harness.frame()
+  expect(collapsed).toContain("+2 more models")
+  expect(collapsed).not.toContain("− show fewer models")
+  expect(collapsed).not.toContain("provider/e")
+  expect(collapsed).not.toContain("provider/f")
+})
+
+test("collapsing the module leaves only the title", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  completeStep(harness, "one", 1_700_000_000_000, 20)
+  await harness.renderOnce()
+  const expanded = harness.frame()
+  expect(expanded).toContain("▼ Model-Performance · observed")
+  expect(expanded).toContain("Session CACHE")
+  expect(expanded).toContain("provider/model")
+
+  const before = harness.renderRequests()
+  harness.controller().toggleModule()
+  expect(harness.controller().moduleCollapsed()).toBe(true)
+  expect(harness.renderRequests()).toBeGreaterThan(before)
+
+  await harness.renderOnce()
+  const collapsed = harness.frame()
+  expect(collapsed).toContain("▶ Model-Performance · observed")
+  expect(collapsed).not.toContain("Session CACHE")
+  expect(collapsed).not.toContain("provider/model")
+
+  harness.controller().toggleModule()
+  expect(harness.controller().moduleCollapsed()).toBe(false)
+  await harness.renderOnce()
+  const restored = harness.frame()
+  expect(restored).toContain("▼ Model-Performance · observed")
+  expect(restored).toContain("Session CACHE")
+  expect(restored).toContain("provider/model")
+})
+
 test("model panel reports session retries without per-model attribution", async () => {
   const harness = await createHarness()
   activeHarness = harness
