@@ -957,6 +957,44 @@ test("changing the active model does not reorder rows", async () => {
   expect(panel.indexOf("provider/a")).toBeLessThan(panel.indexOf("provider/b"))
 })
 
+test("a subagent and its parent swapping activity recency does not reorder rows", async () => {
+  const harness = await createHarness()
+  activeHarness = harness
+
+  const base = 1_700_000_000_000
+  harness.setSession("child", "one")
+  harness.emit("session.created", { sessionID: "child", info: sessionInfo("child", "one") })
+
+  // The parent sees `a` first, then the child sees `b`: first-seen order is a, b.
+  setSystemTime(base)
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "parent-a", sessionID: "one", created: 1, providerID: "provider", modelID: "a" }),
+  })
+  setSystemTime(base + 1_000)
+  harness.emit("message.updated", {
+    sessionID: "child",
+    info: assistantMessage({ id: "child-b", sessionID: "child", created: 2, providerID: "provider", modelID: "b" }),
+  })
+
+  await harness.renderOnce()
+  const before = harness.frame()
+  expect(before.indexOf("provider/a")).toBeLessThan(before.indexOf("provider/b"))
+
+  // The parent becomes the most recently active session again, so the subtree fold order flips
+  // (child first, then parent). The rendered rows must keep their first-seen slots.
+  setSystemTime(base + 2_000)
+  harness.emit("message.updated", {
+    sessionID: "one",
+    info: assistantMessage({ id: "parent-a2", sessionID: "one", created: 3, providerID: "provider", modelID: "a" }),
+  })
+
+  await harness.renderOnce()
+  const after = harness.frame()
+  expect(internals().activeModel("one")).toBe("provider/a")
+  expect(after.indexOf("provider/a")).toBeLessThan(after.indexOf("provider/b"))
+})
+
 test("the row marker moves through busy, streaming, and idle", async () => {
   const harness = await createHarness()
   activeHarness = harness

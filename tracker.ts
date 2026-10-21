@@ -256,6 +256,11 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
   const partDecisions = new Map<string, boolean>()
   const mounted = new Set<string>()
   const order: string[] = []
+  /** Tracker-wide `providerID/modelID -> first-seen sequence`. A key gets its number the first
+   * time any session observes it and never changes it afterwards, so the panel row order is
+   * independent of which session was active most recently. */
+  const modelFirstSeen = new Map<string, number>()
+  let modelSeq = 0
   const listeners: Array<() => void> = []
 
   const bump = () => onChange()
@@ -308,6 +313,8 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     // First sighting decides the slot; later messages for the same model must not move the row.
     if (models.order.indexOf(key) === -1) models.order.push(key)
     if (!models.aggregates[key]) models.aggregates[key] = emptyAggregate()
+    // Tracker-wide rank, assigned once per model key so the panel order survives activity changes.
+    if (!modelFirstSeen.has(key)) modelFirstSeen.set(key, modelSeq++)
   }
 
   const prune = (now = Date.now()) => {
@@ -532,9 +539,13 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     let active: string | undefined
     for (const id of sessions) active = tracker.models[id].active ?? active
 
-    // Fixed row order: `order` is first-appearance order (oldest session first, and within a
-    // session the oldest model first). Neither activity nor the active model reshuffles it, so a
-    // row keeps its slot for the whole session.
+    // Fixed row order: the global first-seen sequence decides the slots, so neither activity nor
+    // the fold order above (which follows the session's last model activity) reshuffles rows.
+    order.sort((left, right) => {
+      const leftSeq = modelFirstSeen.get(left) ?? Number.MAX_SAFE_INTEGER
+      const rightSeq = modelFirstSeen.get(right) ?? Number.MAX_SAFE_INTEGER
+      return leftSeq - rightSeq
+    })
     const visible = order.slice(0, MODEL_ROW_LIMIT)
     const overflow = Math.max(0, order.length - visible.length)
 
