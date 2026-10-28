@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { registerQuote } from "./quote"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, type Accessor } from "solid-js"
 import {
   MODEL_ROW_LIMIT,
@@ -297,6 +298,8 @@ function ModelPanelView(props: {
 }
 
 const tui: TuiPlugin = async (api) => {
+  registerQuote(api)
+
   const [revision, setRevision] = createSignal(0)
   const tracker = createTracker(api, () => setRevision((value) => value + 1))
 

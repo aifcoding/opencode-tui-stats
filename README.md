@@ -1,6 +1,9 @@
 # opencode-tui-stats
 
-OpenCode 1.x（v1）的 TUI 插件，安装在右侧栏内容区（slot `sidebar_content`），面板标题为 `Model-Performance · observed`。每个模型占一行，鼠标点击可折叠/展开。
+OpenCode 1.x（v1）的 TUI 插件，提供两个能力：
+
+1. **模型性能面板**：安装在右侧栏内容区（slot `sidebar_content`），面板标题 `Model-Performance · observed`，每个模型占一行，鼠标点击可折叠/展开；
+2. **引用消息**：`ctrl+q` 选中历史消息，把原文以引用形式插入输入框，再补问题发送。
 
 ## 演示
 
@@ -13,6 +16,25 @@ opencode plugin opencode-tui-stats --global
 ```
 
 该命令会把插件写入 opencode 的 tui 配置。也可以从 npm 安装 `opencode-tui-stats` 包。
+
+## 引用消息
+
+`ctrl+q`（或输入 `/quote`）打开居中的消息选择框，列出当前会话最近 40 条有文本的 user/assistant 消息，支持输入关键字过滤。
+
+选中后会把该条消息以 Markdown 引用插入当前输入框：
+
+```
+> 原文第一行
+> 原文第二行
+
+```
+
+然后继续写你的问题，回车发送。
+
+- 单条最多引用 2000 字，超出会截断并标注「…（已截断）」
+- 只插入文本，不会自动发送
+- 备用快捷键：`ctrl+shift+q`
+- 引用是纯文本，不会在 TUI 里渲染成引用卡片
 
 ## 环境要求
 

@@ -148,6 +148,9 @@ async function createHarness(): Promise<Harness> {
         return unsubscribe
       },
     },
+    keymap: {
+      registerLayer: () => {},
+    },
     state: {
       session: {
         status: (sessionID: string) => statuses.get(sessionID),
