@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
-import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { registerQuote } from "./quote"
+import { Plugin } from "@opencode/plugin/tui"
+import type { Context } from "@opencode/plugin/tui/context"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, type Accessor } from "solid-js"
 import {
   MODEL_ROW_LIMIT,
@@ -68,7 +68,7 @@ function createPressGuard(onActivate: () => void) {
 
 /** A single model row: fold marker + summary line, plus its detail lines when expanded. */
 function ModelRowView(props: {
-  api: TuiPluginApi
+  context: Context
   row: ModelRow
   expanded: boolean
   frame: number
@@ -76,7 +76,7 @@ function ModelRowView(props: {
 }) {
   const press = createPressGuard(() => props.onToggle())
 
-  const theme = () => props.api.theme.current
+  const theme = () => props.context.theme
   const parts = () => splitLabel(props.row.label)
   // Three-state marker: streaming spins, a busy model that has not produced tokens yet shows a
   // solid dot, and every other row keeps a blank slot so names stay aligned.
@@ -90,41 +90,41 @@ function ModelRowView(props: {
       <text wrapMode="none" truncate>
         {/* The animated marker flags a model that is streaming right now, so parallel sessions can
          * light up several rows at once; a busy row that has not tokenised yet gets a solid dot. */}
-        <span style={{ fg: theme().success } as Record<string, unknown>}>{marker()}</span>
-        <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{`${props.expanded ? "▼" : "▶"} `}</span>
+        <span style={{ fg: theme().text.feedback.success.base } as Record<string, unknown>}>{marker()}</span>
+        <span style={{ fg: theme().text.muted } as Record<string, unknown>}>{`${props.expanded ? "▼" : "▶"} `}</span>
         <Show when={props.row.subagent}>
-          <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{"↳ "}</span>
+          <span style={{ fg: theme().text.muted } as Record<string, unknown>}>{"↳ "}</span>
         </Show>
         <Show when={parts().provider}>
           {/* Dimmed foreground sits between the model name and muted metadata without borrowing
            * a status colour, so the provider reads as its own tier even as themes change. */}
-          <span style={{ fg: theme().text, dim: true } as Record<string, unknown>}>{parts().provider}</span>
+          <span style={{ fg: theme().text.base, dim: true } as Record<string, unknown>}>{parts().provider}</span>
         </Show>
-        <span style={{ fg: theme().text } as Record<string, unknown>}>{parts().model}</span>
+        <span style={{ fg: theme().text.base } as Record<string, unknown>}>{parts().model}</span>
         {/* Only a live stream gets an inline rate, so collapsed rows still expose parallel activity
          * without expanding; the frozen value stays in the expanded detail lines. */}
         <Show when={props.row.streaming && props.row.tps !== undefined}>
-          <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{`  ${rateCell(props.row.tps)}`}</span>
+          <span style={{ fg: theme().text.muted } as Record<string, unknown>}>{`  ${rateCell(props.row.tps)}`}</span>
         </Show>
       </text>
       <Show when={props.expanded}>
-        <text fg={theme().textMuted} wrapMode="none" truncate>
-          <span style={{ fg: theme().textMuted } as Record<string, unknown>}>
+        <text fg={theme().text.muted} wrapMode="none" truncate>
+          <span style={{ fg: theme().text.muted } as Record<string, unknown>}>
             {`${DETAIL_INDENT}AVG ${rateCell(props.row.avg)}`}
           </span>
           <Show when={props.row.tps !== undefined}>
-            <span style={{ fg: theme().textMuted } as Record<string, unknown>}>{" · TPS "}</span>
+            <span style={{ fg: theme().text.muted } as Record<string, unknown>}>{" · TPS "}</span>
             {/* A frozen final reading stays visible but is dimmed to distinguish it from a
              * value backed by an active stream. */}
-            <span style={{ fg: theme().textMuted, dim: !props.row.tpsLive } as Record<string, unknown>}>
+            <span style={{ fg: theme().text.muted, dim: !props.row.tpsLive } as Record<string, unknown>}>
               {rateCell(props.row.tps)}
             </span>
           </Show>
         </text>
-        <text fg={theme().textMuted} wrapMode="none" truncate>
+        <text fg={theme().text.muted} wrapMode="none" truncate>
           {`${DETAIL_INDENT}TTFT ${ttftCell(props.row.ttft)} · CACHE ${cacheCell(props.row.cache)}`}
         </text>
-        <text fg={theme().textMuted} wrapMode="none" truncate>
+        <text fg={theme().text.muted} wrapMode="none" truncate>
           {`${DETAIL_INDENT}${props.row.cost ?? "—"}`}
         </text>
       </Show>
@@ -134,12 +134,12 @@ function ModelRowView(props: {
 
 /** Overflow row: either counts the hidden models or offers to fold the list back. It shares the
  * row click handling so a click (not a drag) expands or collapses the full list. */
-function OverflowRow(props: { api: TuiPluginApi; label: string; onActivate: () => void }) {
+function OverflowRow(props: { context: Context; label: string; onActivate: () => void }) {
   const press = createPressGuard(() => props.onActivate())
 
   return (
     <box flexDirection="column" onMouseDown={press.onMouseDown} onMouseUp={press.onMouseUp}>
-      <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+      <text fg={props.context.theme.text.muted} wrapMode="none" truncate>
         {props.label}
       </text>
     </box>
@@ -148,7 +148,7 @@ function OverflowRow(props: { api: TuiPluginApi; label: string; onActivate: () =
 
 /** Per-session model panel, mounted into the sidebar content (after the built-in sections). */
 function ModelPanelView(props: {
-  api: TuiPluginApi
+  context: Context
   sessionID: string
   tracker: TrackerHandle
   revision: Accessor<number>
@@ -189,7 +189,7 @@ function ModelPanelView(props: {
       // tick has to request a render or the glyph would stay on its first frame.
       animationTimer = setInterval(() => {
         setNow(Date.now())
-        props.api.renderer?.requestRender?.()
+        props.context.renderer.requestRender()
       }, SPINNER_MS)
     } else if (!streaming && animationTimer !== undefined) {
       clearInterval(animationTimer)
@@ -223,17 +223,17 @@ function ModelPanelView(props: {
       else next.add(key)
       return next
     })
-    props.api.renderer?.requestRender?.()
+    props.context.renderer.requestRender()
   }
 
   const toggleOverflow = () => {
     setShowAll((prev) => !prev)
-    props.api.renderer?.requestRender?.()
+    props.context.renderer.requestRender()
   }
 
   const toggleCollapsed = () => {
     setCollapsed((prev) => !prev)
-    props.api.renderer?.requestRender?.()
+    props.context.renderer.requestRender()
   }
 
   // Reuse the row click guard so a drag-select over the title does not fold the module.
@@ -260,7 +260,7 @@ function ModelPanelView(props: {
       <box flexDirection="column" onMouseDown={titlePress.onMouseDown} onMouseUp={titlePress.onMouseUp}>
         <text wrapMode="none" truncate>
           {/* Fold marker stays muted so the bright bold title keeps the emphasis it had before. */}
-          <span style={{ fg: props.api.theme.current.textMuted } as Record<string, unknown>}>
+          <span style={{ fg: props.context.theme.text.muted } as Record<string, unknown>}>
             {collapsed() ? "▶ " : "▼ "}
           </span>
           <b>Model-Performance · observed</b>
@@ -268,14 +268,14 @@ function ModelPanelView(props: {
       </box>
       <Show when={!collapsed()}>
         <Show when={panel().rows.length === 0}>
-          <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+          <text fg={props.context.theme.text.muted} wrapMode="none" truncate>
             —
           </text>
         </Show>
         <For each={panel().rows}>
           {(row) => (
             <ModelRowView
-              api={props.api}
+              context={props.context}
               row={row}
               expanded={expanded().has(row.key)}
               frame={frame()}
@@ -284,12 +284,12 @@ function ModelPanelView(props: {
           )}
         </For>
         <Show when={!showAll() && panel().overflow > 0}>
-          <OverflowRow api={props.api} label={`+${panel().overflow} more models`} onActivate={toggleOverflow} />
+          <OverflowRow context={props.context} label={`+${panel().overflow} more models`} onActivate={toggleOverflow} />
         </Show>
         <Show when={showAll() && panel().rows.length > MODEL_ROW_LIMIT}>
-          <OverflowRow api={props.api} label="− show fewer models" onActivate={toggleOverflow} />
+          <OverflowRow context={props.context} label="− show fewer models" onActivate={toggleOverflow} />
         </Show>
-        <text fg={props.api.theme.current.textMuted} wrapMode="none" truncate>
+        <text fg={props.context.theme.text.muted} wrapMode="none" truncate>
           {`Session CACHE ${panel().cache ?? "—"}${panel().retries > 0 ? ` · retries ${panel().retries}` : ""}`}
         </text>
       </Show>
@@ -297,26 +297,22 @@ function ModelPanelView(props: {
   )
 }
 
-const tui: TuiPlugin = async (api) => {
-  registerQuote(api)
-
-  const [revision, setRevision] = createSignal(0)
-  const tracker = createTracker(api, () => setRevision((value) => value + 1))
-
-  api.lifecycle.onDispose(() => tracker.dispose())
-
-  api.slots.register({
-    slots: {
-      sidebar_content(_context, props) {
-        return <ModelPanelView api={api} sessionID={props.session_id} tracker={tracker} revision={revision} />
-      },
-    },
-  })
-}
-
-const plugin: TuiPluginModule = {
+export default Plugin.define({
   id: "opencode-tui-stats",
-  tui,
-}
+  setup(context) {
+    const [revision, setRevision] = createSignal(0)
+    const tracker = createTracker(context, () => setRevision((value) => value + 1))
 
-export default plugin
+    const unregisterSlot = context.ui.slot({
+      prepend: "sidebar.content",
+      render: ({ sessionID }) => (
+        <ModelPanelView context={context} sessionID={sessionID} tracker={tracker} revision={revision} />
+      ),
+    })
+
+    return () => {
+      unregisterSlot()
+      tracker.dispose()
+    }
+  },
+})

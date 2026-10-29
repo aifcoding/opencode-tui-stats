@@ -1,9 +1,6 @@
 # opencode-tui-stats
 
-OpenCode 1.x（v1）的 TUI 插件，提供两个能力：
-
-1. **模型性能面板**：安装在右侧栏内容区（slot `sidebar_content`），面板标题 `Model-Performance · observed`，每个模型占一行，鼠标点击可折叠/展开；
-2. **引用消息**：`ctrl+q` 选中历史消息，把原文以引用形式插入输入框，再补问题发送。
+OpenCode 2.x（V2）的 TUI 插件：在右侧栏内容区顶部（slot `sidebar.content`，prepend 方式）展示模型性能面板，标题为 `Model-Performance · observed`，每个模型占一行，鼠标点击可折叠/展开。
 
 ## 演示
 
@@ -12,33 +9,30 @@ OpenCode 1.x（v1）的 TUI 插件，提供两个能力：
 ## 安装
 
 ```bash
-opencode plugin opencode-tui-stats --global
+opencode plugin add opencode-tui-stats
 ```
 
-该命令会把插件写入 opencode 的 tui 配置。也可以从 npm 安装 `opencode-tui-stats` 包。
+该命令会把插件写入全局 `opencode.json(c)` 的 `plugins`。也可以手动添加：
 
-## 引用消息
-
-`ctrl+q`（或输入 `/quote`）打开居中的消息选择框，列出当前会话最近 40 条有文本的 user/assistant 消息，支持输入关键字过滤。
-
-选中后会把该条消息以 Markdown 引用插入当前输入框：
-
-```
-> 原文第一行
-> 原文第二行
-
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-tui-stats"],
+}
 ```
 
-然后继续写你的问题，回车发送。
+如果只想在本机终端里启用（连接远程服务端时仍然生效），可以写进 `cli.json`：
 
-- 单条最多引用 2000 字，超出会截断并标注「…（已截断）」
-- 只插入文本，不会自动发送
-- 备用快捷键：`ctrl+shift+q`
-- 引用是纯文本，不会在 TUI 里渲染成引用卡片
+```jsonc
+{
+  "plugins": ["opencode-tui-stats"],
+}
+```
 
 ## 环境要求
 
-- opencode ≥ 1.3.14
+- opencode ≥ 2.0.0（V2 插件 API）
+- V1 插件实现不会在 V2 中运行，本版本不兼容 OpenCode 1.x
 
 ## 折叠与子会话
 
@@ -54,11 +48,18 @@ opencode plugin opencode-tui-stats --global
 ## 指标说明
 
 - `TPS`：最近约 5 秒流式窗口内的生成速度（token/秒）；停止后冻结最后值并变暗。
-- `AVG`：本会话已完成消息的平均生成速度（token/秒）。
+- `AVG`：本会话已完成 step 的平均生成速度（token/秒）。
 - `TTFT`：平均首字延迟（秒，近似值，包含排队/重试等待）。
 - `CACHE`：提示词缓存命中率 = `cache.read / (input + cache.read + cache.write)`，1 位小数。
 - `COST`：会话累计成本（按模型/会话聚合）。
-- `RETRY`：按 provider 上报的 attempt 统计的重试次数。
+- `RETRY`：按 `session.status` 上报的 attempt 统计的重试次数。
+
+数据来源是 V2 的 `session.step.started` / `session.text.delta` / `session.reasoning.delta` / `session.step.ended` 等事件；`session.step.ended` 按事件 id 去重，断线重放不会重复累计。
+
+## 与 V1 版本的差异
+
+- 引用消息（`ctrl+q`）已移除：V2 的 TUI 插件 API 不再提供向输入框追加文本的能力（`client.tui.appendPrompt` 已删除），`tui.prompt.append` 事件只由 TUI 消费、插件无法发出。
+- 面板 API 从 `TuiPluginApi` 改为 V2 的 `Plugin.define` + `Context`（`context.ui.slot`、`context.data`、`context.theme`）。
 
 ## License
 

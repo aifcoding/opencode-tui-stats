@@ -1,4 +1,4 @@
-import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
+import type { Context } from "@opencode/plugin/tui/context"
 
 export type StreamSample = {
   at: number
@@ -73,8 +73,7 @@ export type Tracker = {
 const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
-const PART_CACHE_LIMIT = 1_024
-/** Per-session dedup window: only the most recent completed messages are deduplicated;
+/** Per-session dedup window: only the most recent completed steps are deduplicated;
  * a repeated completed event beyond this window accumulates again. */
 const DEDUP_WINDOW_LIMIT = 64
 /** Cap on `messageID -> model` entries retained per session (FIFO). */
@@ -212,14 +211,12 @@ export type ModelPanel = {
 
 export type TrackerInternals = {
   sizes(): {
-    parts: number
     dedup: number
     stats: number
     averages: number
     timings: number
     mounted: number
   }
-  partDecision(partID: string): boolean | undefined
   hasStats(sessionID: string): boolean
   dedupSize(sessionID: string): number
   retries(sessionID: string): number
@@ -243,7 +240,7 @@ export function getLastInternals(): TrackerInternals | undefined {
   return lastInternals
 }
 
-export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerHandle {
+export function createTracker(context: Context, onChange: () => void): TrackerHandle {
   const tracker: Tracker = {
     samples: {},
     timings: {},
@@ -253,7 +250,6 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     models: {},
     parentOf: {},
   }
-  const partDecisions = new Map<string, boolean>()
   const mounted = new Set<string>()
   const order: string[] = []
   /** Tracker-wide `providerID/modelID -> first-seen sequence`. A key gets its number the first
@@ -346,8 +342,8 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
    * `messageID -> model` mapping. Returns a number (never a formatted string) so callers can sum
    * concurrent streams. `live: false` means this session is idle or its samples are stale. */
   const sessionLiveRateValue = (sessionID: string, key: string): { rate?: number; live: boolean } => {
-    const status = api.state.session.status(sessionID)
-    if (!status || status.type === "idle") return { live: false }
+    const status = context.data.session.status(sessionID)
+    if (status === "idle") return { live: false }
 
     const now = Date.now()
     const mapping = tracker.models[sessionID]?.messageModels
@@ -367,7 +363,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
    * A successful lookup is cached; an unknown session is retried on the next render. */
   const resolveParent = (sessionID: string) => {
     if (sessionID in tracker.parentOf) return
-    const info = api.state.session.get(sessionID)
+    const info = context.data.session.get(sessionID)
     if (!info) return
     tracker.parentOf[sessionID] = info.parentID
   }
@@ -438,8 +434,7 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
    * Used per row so a model that just started processing shows the solid dot instead of the
    * spinner. */
   const sessionBusy = (sessionID: string) => {
-    const status = api.state.session.status(sessionID)
-    return status !== undefined && status.type !== "idle"
+    return context.data.session.status(sessionID) === "running"
   }
 
   /** Live rate for a merged row. A model can stream in several sessions of the same subtree at
@@ -575,147 +570,210 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
     return { rows, overflow, retries, cache }
   }
 
+  const ensureModels = (sessionID: string) =>
+    tracker.models[sessionID] ??
+    (tracker.models[sessionID] = { order: [], aggregates: {}, messageModels: new Map(), lastRate: {} })
+
+  /** Model of a step that started before the plugin observed it (or before `step.started`). */
+  const modelOfMessage = (sessionID: string, assistantMessageID: string) => {
+    const info = context.data.session.message.get(sessionID, assistantMessageID)
+    if (info?.type !== "assistant") return undefined
+    return modelKey(info.model.providerID, info.model.id)
+  }
+
+  /** Returns false when this durable event was already folded in. */
+  const firstDelivery = (sessionID: string, eventID: string) => {
+    const seen = tracker.dedup[sessionID] ?? (tracker.dedup[sessionID] = new Set<string>())
+    if (seen.has(eventID)) return false
+    boundedAdd(seen, eventID, DEDUP_WINDOW_LIMIT)
+    return true
+  }
+
+  const markFirstResponse = (sessionID: string, assistantMessageID: string, at: number) => {
+    const timing = tracker.timings[assistantMessageID]
+    if (!timing || timing.sessionID !== sessionID || timing.firstResponseAt !== undefined) return
+    timing.firstResponseAt = at
+    bump()
+  }
+
+  // Text and reasoning deltas are already classified by the server, so every delta is model
+  // output and no part lookup is needed (unlike the V1 `message.part.delta` stream).
+  const countDelta = (sessionID: string, messageID: string, delta: string, at: number) => {
+    appendSample(sessionID, messageID, { at, messageID, tokens: estimateTokens(delta) })
+  }
+
   listeners.push(
-    api.event.on("message.part.delta", (event) => {
-      if (event.properties.field !== "text") return
-      const { sessionID, messageID, partID } = event.properties
-
-      // partID → decision (true = counted, false = ignored). A part that is not registered yet is
-      // never cached, so the next delta retries the lookup; once found the accept/reject decision
-      // is cached so each part is scanned at most once.
-      let counted = partDecisions.get(partID)
-      if (counted === undefined) {
-        const part = api.state.part(messageID).find((item) => item.id === partID)
-        if (!part) return
-        counted = part.type === "text" || part.type === "reasoning"
-        boundedSet(partDecisions, partID, counted, PART_CACHE_LIMIT)
-      }
-      if (!counted) return
-
-      appendSample(sessionID, messageID, {
-        at: Date.now(),
-        messageID,
-        tokens: estimateTokens(event.properties.delta),
-      })
+    context.data.on("session.text.delta", (event) => {
+      countDelta(event.data.sessionID, event.data.assistantMessageID, event.data.delta, event.created)
     }),
   )
 
   listeners.push(
-    api.event.on("message.updated", (event) => {
-      const info = event.properties.info
-      if (info.role !== "assistant") return
-      const sessionID = event.properties.sessionID
-      const key = modelKey(info.providerID, info.modelID)
+    context.data.on("session.reasoning.delta", (event) => {
+      countDelta(event.data.sessionID, event.data.assistantMessageID, event.data.delta, event.created)
+    }),
+  )
 
-      // Observe the model as soon as a message appears so the sidebar can attribute live samples
-      // and mark the most recently used model as active.
-      const models =
-        tracker.models[sessionID] ??
-        (tracker.models[sessionID] = { order: [], aggregates: {}, messageModels: new Map(), lastRate: {} })
+  listeners.push(
+    context.data.on("session.text.started", (event) => {
+      markFirstResponse(event.data.sessionID, event.data.assistantMessageID, event.created)
+    }),
+  )
+
+  listeners.push(
+    context.data.on("session.reasoning.started", (event) => {
+      markFirstResponse(event.data.sessionID, event.data.assistantMessageID, event.created)
+    }),
+  )
+
+  // Observe the model as soon as a step starts so the sidebar can attribute live samples and mark
+  // the most recently used model as active. Each step is one model request, so its timing resets.
+  listeners.push(
+    context.data.on("session.step.started", (event) => {
+      const { sessionID, assistantMessageID, model, started } = event.data
+      const key = modelKey(model.providerID, model.id)
+      const models = ensureModels(sessionID)
       touchModel(models, key)
       models.active = key
-      models.aggregates[key] = { ...models.aggregates[key], lastAt: Date.now() }
-      boundedSet(models.messageModels, info.id, key, MESSAGE_MODEL_LIMIT)
+      models.aggregates[key] = { ...models.aggregates[key], lastAt: event.created }
+      boundedSet(models.messageModels, assistantMessageID, key, MESSAGE_MODEL_LIMIT)
+      tracker.timings[assistantMessageID] = { sessionID, requestStartAt: started }
+      bump()
+    }),
+  )
 
-      if (!info.time.completed) {
-        const existing = tracker.timings[info.id]
-        tracker.timings[info.id] = {
-          sessionID,
-          requestStartAt: info.time.created,
-          firstResponseAt: existing?.firstResponseAt,
-          lastToolCallAt: existing?.lastToolCallAt,
-        }
-        bump()
-        return
+  // A completed step folds its usage into the session and model aggregates. Statistics are
+  // deduplicated by durable event id, so a replayed event never accumulates twice.
+  const accumulateStep = (
+    eventID: string,
+    sessionID: string,
+    assistantMessageID: string,
+    tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } },
+    cost: number,
+    finish: string,
+    completedAt: number,
+  ) => {
+    if (!firstDelivery(sessionID, eventID)) return
+    touchSession(sessionID)
+
+    const cacheRead = tokens.cache.read
+    const cacheWrite = tokens.cache.write
+    const stats = tracker.stats[sessionID] ?? emptyStats()
+    tracker.stats[sessionID] = {
+      ...stats,
+      cacheRead: stats.cacheRead + cacheRead,
+      cachePrompt: stats.cachePrompt + tokens.input + cacheRead + cacheWrite,
+      cost: stats.cost + cost,
+      steps: stats.steps + 1,
+    }
+
+    const models = tracker.models[sessionID]
+    const key = models?.messageModels.get(assistantMessageID) ?? modelOfMessage(sessionID, assistantMessageID) ?? models?.active
+    if (models && key) {
+      touchModel(models, key)
+      const aggregate = models.aggregates[key]
+      models.aggregates[key] = {
+        ...aggregate,
+        cacheRead: aggregate.cacheRead + cacheRead,
+        cachePrompt: aggregate.cachePrompt + tokens.input + cacheRead + cacheWrite,
+        cost: aggregate.cost + cost,
+        steps: aggregate.steps + 1,
+        lastAt: Math.max(aggregate.lastAt, completedAt),
       }
+    }
 
-      // Dedup only the most recent completed messages for this session; a repeated completed
-      // event beyond the window accumulates again.
-      const seen = tracker.dedup[sessionID] ?? (tracker.dedup[sessionID] = new Set<string>())
-      if (!seen.has(info.id)) {
-        boundedAdd(seen, info.id, DEDUP_WINDOW_LIMIT)
-        touchSession(sessionID)
-        const stats = tracker.stats[sessionID] ?? emptyStats()
-        const cacheRead = info.tokens.cache.read
-        const cacheWrite = info.tokens.cache.write
-        tracker.stats[sessionID] = {
-          ...stats,
-          cacheRead: stats.cacheRead + cacheRead,
-          cachePrompt: stats.cachePrompt + info.tokens.input + cacheRead + cacheWrite,
-          cost: stats.cost + info.cost,
-          steps: stats.steps + 1,
+    const timing = tracker.timings[assistantMessageID]
+    if (timing?.sessionID === sessionID && timing.firstResponseAt !== undefined) {
+      const output = tokens.output + tokens.reasoning
+      // A tool-calling step ends when its last tool call was issued; the remaining wall clock is
+      // tool execution, not generation.
+      const endAt = finish === "tool-calls" ? timing.lastToolCallAt : completedAt
+      const durationMs = endAt !== undefined ? Math.max(endAt - timing.firstResponseAt, 1) : undefined
+      if (output > 0 && durationMs !== undefined) {
+        const ttftMs = Math.max(timing.firstResponseAt - timing.requestStartAt, 0)
+        const totals = tracker.averages[sessionID] ?? {
+          totalTokens: 0,
+          totalDurationMs: 0,
+          totalTtftMs: 0,
+          stepCount: 0,
         }
-        const aggregate = models.aggregates[key] ?? emptyAggregate()
-        models.aggregates[key] = {
-          ...aggregate,
-          cacheRead: aggregate.cacheRead + cacheRead,
-          cachePrompt: aggregate.cachePrompt + info.tokens.input + cacheRead + cacheWrite,
-          cost: aggregate.cost + info.cost,
-          steps: aggregate.steps + 1,
+        tracker.averages[sessionID] = {
+          totalTokens: totals.totalTokens + output,
+          totalDurationMs: totals.totalDurationMs + durationMs,
+          totalTtftMs: totals.totalTtftMs + ttftMs,
+          stepCount: totals.stepCount + 1,
         }
-      }
-
-      const timing = tracker.timings[info.id]
-      if (timing?.sessionID === sessionID && timing.firstResponseAt !== undefined) {
-        const tokens = info.tokens.output + info.tokens.reasoning
-        const endAt = info.finish === "tool-calls" ? timing.lastToolCallAt : info.time.completed
-        const durationMs = endAt !== undefined ? Math.max(endAt - timing.firstResponseAt, 1) : undefined
-        if (tokens > 0 && durationMs !== undefined) {
-          const totals = tracker.averages[sessionID] ?? {
-            totalTokens: 0,
-            totalDurationMs: 0,
-            totalTtftMs: 0,
-            stepCount: 0,
-          }
-          tracker.averages[sessionID] = {
-            totalTokens: totals.totalTokens + tokens,
-            totalDurationMs: totals.totalDurationMs + durationMs,
-            totalTtftMs: totals.totalTtftMs + Math.max(timing.firstResponseAt - timing.requestStartAt, 0),
-            stepCount: totals.stepCount + 1,
-          }
-          const aggregate = models.aggregates[key] ?? emptyAggregate()
+        if (models && key) {
+          const aggregate = models.aggregates[key]
           models.aggregates[key] = {
             ...aggregate,
-            totalTokens: aggregate.totalTokens + tokens,
+            totalTokens: aggregate.totalTokens + output,
             totalDurationMs: aggregate.totalDurationMs + durationMs,
-            totalTtftMs: aggregate.totalTtftMs + Math.max(timing.firstResponseAt - timing.requestStartAt, 0),
+            totalTtftMs: aggregate.totalTtftMs + ttftMs,
             stepCount: aggregate.stepCount + 1,
           }
         }
       }
-      delete tracker.timings[info.id]
-      prune(info.time.completed)
+    }
+    delete tracker.timings[assistantMessageID]
+    prune(completedAt)
+    bump()
+  }
+
+  listeners.push(
+    context.data.on("session.step.ended", (event) => {
+      const { sessionID, assistantMessageID, tokens, cost, finish } = event.data
+      accumulateStep(event.id, sessionID, assistantMessageID, tokens, cost, finish, event.created)
+    }),
+  )
+
+  listeners.push(
+    context.data.on("session.step.failed", (event) => {
+      const { sessionID, assistantMessageID, tokens, cost } = event.data
+      if (!tokens) {
+        delete tracker.timings[assistantMessageID]
+        bump()
+        return
+      }
+      accumulateStep(event.id, sessionID, assistantMessageID, tokens, cost ?? 0, "error", event.created)
+    }),
+  )
+
+  // Tool activity replaces the live text stream. Tool-input generation marks the first response of
+  // a tool-only step, and the issued call ends the generation window for a `tool-calls` finish.
+  listeners.push(
+    context.data.on("session.tool.input.started", (event) => {
+      markFirstResponse(event.data.sessionID, event.data.assistantMessageID, event.created)
+    }),
+  )
+
+  listeners.push(
+    context.data.on("session.tool.called", (event) => {
+      const { sessionID, assistantMessageID } = event.data
+      clearLive(sessionID)
+      const timing = tracker.timings[assistantMessageID]
+      if (!timing || timing.sessionID !== sessionID) return
+      timing.lastToolCallAt = event.created
+      if (timing.firstResponseAt === undefined) timing.firstResponseAt = event.created
       bump()
     }),
   )
 
   listeners.push(
-    api.event.on("message.part.updated", (event) => {
-      const part = event.properties.part
-      if (part.type !== "tool") return
-
-      if (part.state.status === "running" || part.state.status === "completed" || part.state.status === "error") {
-        clearLive(part.sessionID)
-      }
-
-      const timing = tracker.timings[part.messageID]
-      if (!timing) return
-
-      if (part.state.status === "pending") {
-        if (timing.firstResponseAt === undefined) timing.firstResponseAt = Date.now()
-        bump()
-        return
-      }
-      if (part.state.status === "running") {
-        timing.lastToolCallAt = part.state.time.start
-        bump()
-      }
+    context.data.on("session.tool.success", (event) => {
+      clearLive(event.data.sessionID)
     }),
   )
 
   listeners.push(
-    api.event.on("session.status", (event) => {
-      const { sessionID, status } = event.properties
+    context.data.on("session.tool.failed", (event) => {
+      clearLive(event.data.sessionID)
+    }),
+  )
+
+  listeners.push(
+    context.data.on("session.status", (event) => {
+      const { sessionID, status } = event.data
       const type = status.type
 
       if (type === "idle") clearTimings(sessionID)
@@ -746,21 +804,15 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
   )
 
   listeners.push(
-    api.event.on("session.idle", (event) => {
-      clearTimings(event.properties.sessionID)
+    context.data.on("session.idle", (event) => {
+      clearTimings(event.data.sessionID)
     }),
   )
 
   // Subagent sessions announce their parent here; the tree is also backfilled lazily from state.
   listeners.push(
-    api.event.on("session.created", (event) => {
-      rememberParent(event.properties.info.id, event.properties.info.parentID)
-    }),
-  )
-
-  listeners.push(
-    api.event.on("session.updated", (event) => {
-      rememberParent(event.properties.info.id, event.properties.info.parentID)
+    context.data.on("session.created", (event) => {
+      rememberParent(event.data.sessionID, event.data.parentID)
     }),
   )
 
@@ -772,14 +824,12 @@ export function createTracker(api: TuiPluginApi, onChange: () => void): TrackerH
 
   const internals: TrackerInternals = {
     sizes: () => ({
-      parts: partDecisions.size,
       dedup: Object.values(tracker.dedup).reduce((sum, set) => sum + set.size, 0),
       stats: Object.keys(tracker.stats).length,
       averages: Object.keys(tracker.averages).length,
       timings: Object.keys(tracker.timings).length,
       mounted: mounted.size,
     }),
-    partDecision: (partID) => partDecisions.get(partID),
     hasStats: (sessionID) => sessionID in tracker.stats,
     dedupSize: (sessionID) => tracker.dedup[sessionID]?.size ?? 0,
     retries: (sessionID) => tracker.stats[sessionID]?.retries ?? 0,

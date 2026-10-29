@@ -5,7 +5,6 @@ import { runtimeModuleIdForSpecifier } from "@opentui/core/runtime-plugin"
 // so a plugin installed from npm must ship pre-compiled JSX.
 // Shared runtime imports keep the plugin's signals and renderables in the host.
 const shared = new Set([
-  "@opencode-ai/plugin/tui",
   "@opencode/plugin/tui",
   "@opentui/core",
   "@opentui/solid",

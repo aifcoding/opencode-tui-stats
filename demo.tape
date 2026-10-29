@@ -1,7 +1,7 @@
 # Reproducible demo recording for the README.
 # Run from a scratch project so the recorded paths do not expose a home directory:
-#   mkdir -p /tmp/oc-demo/.opencode
-#   printf '{"plugin":["/Users/gaosper/Documents/opencode-tui-stats"]}' > /tmp/oc-demo/.opencode/tui.json
+#   mkdir -p /tmp/oc-demo
+#   printf '{"plugins":["/Users/gaosper/Documents/opencode-tui-stats"]}' > /tmp/oc-demo/opencode.json
 #   cd /tmp/oc-demo && vhs /Users/gaosper/Documents/opencode-tui-stats/demo.tape
 #
 # The prompt spawns subagents backed by *different* models, so the panel shows several
